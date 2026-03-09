@@ -27,5 +27,5 @@ dependencies:
       - qwen-vl-utils
       # Flash Attention for Qwen-VL memory efficiency
       - flash-attn
-      # Automated Reward Model
-      - git+https://github.com/IDEA-Research/GroundingDINO.git
+      # GroundingDINO: install after env create (see scripts/install_grounding_dino.sh)
+      # pip install --no-build-isolation git+https://github.com/IDEA-Research/GroundingDINO.git

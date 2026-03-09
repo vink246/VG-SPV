@@ -22,7 +22,8 @@ VG-SPV/
 ├── models/                # VG-PRM reward logic and TinyLLaVA model wrappers
 │   └── reward_dino.py     # Grounding DINO IoU-based reward computation
 ├── scripts/               # Bash scripts for launching training/eval runs
-│   └── run_dpo_train.sh   # Launch DPO training
+│   ├── run_dpo_train.sh   # Launch DPO training
+│   └── install_grounding_dino.sh # Install Grounding DINO after env create
 ├── train/                 # DPO pipeline (TRL DPOTrainer) and VG-fDPO loss stub
 │   ├── dpo_trainer.py     # VGSPVTrainer (override compute_loss for VG-fDPO)
 │   ├── dataset_adapter.py # DPO dataset contract and CSV loader (image, perturbed_image, chosen/rejected reasoning traces)
@@ -51,7 +52,30 @@ conda env create -f environment.yml
 conda activate vg-spv
 ```
 
-### 3. Dependencies
+If you use a custom prefix (e.g. on a cluster):
+
+```bash
+conda env create --prefix ~/scratch/envs/vg-spv -f environment.yml
+conda activate ~/scratch/envs/vg-spv
+```
+
+### 3. Install Grounding DINO (required for VG-PRM reward)
+
+Grounding DINO must be installed **after** the env is created so its build can see the conda-installed PyTorch (pip’s build isolation would otherwise fail):
+
+```bash
+pip install --no-build-isolation 'git+https://github.com/IDEA-Research/GroundingDINO.git'
+```
+
+Or use the helper script (with env activated, or pass the env path):
+
+```bash
+bash scripts/install_grounding_dino.sh
+# or, for a prefix env:
+bash scripts/install_grounding_dino.sh ~/scratch/envs/vg-spv
+```
+
+### 4. Dependencies
 
 The `environment.yml` includes:
 
@@ -63,7 +87,7 @@ The `environment.yml` includes:
 
 Ensure you have a CUDA-capable GPU and enough VRAM for training/eval.
 
-### 4. (Optional) API keys and data
+### 5. (Optional) API keys and data
 
 - For `data/generate_traces.py`: set your **OpenAI API key** (GPT-4o) if synthesizing traces.  
 - Download or configure paths for **COCO**, **VLGuard**, and **VisCRA** datasets as required by the data scripts.
