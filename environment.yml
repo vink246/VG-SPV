@@ -1,0 +1,31 @@
+name: vg-spv
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  # Core Python & Build tools
+  - python=3.10
+  - pip
+  - ninja
+  - packaging
+  
+  # PyTorch ecosystem (Compiled with CUDA 12.1)
+  - pytorch>=2.4.0
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  
+  # Pip dependencies for specific ML libraries
+  - pip:
+      - transformers>=4.45.0
+      - accelerate
+      - peft
+      - trl
+      - datasets
+      - qwen-vl-utils
+      # Flash Attention for Qwen-VL memory efficiency
+      - flash-attn --no-build-isolation
+      # Automated Reward Model
+      - git+https://github.com/IDEA-Research/GroundingDINO.git
