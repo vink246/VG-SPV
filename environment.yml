@@ -26,6 +26,6 @@ dependencies:
       - datasets
       - qwen-vl-utils
       # Flash Attention for Qwen-VL memory efficiency
-      - flash-attn --no-build-isolation
+      - flash-attn
       # Automated Reward Model
       - git+https://github.com/IDEA-Research/GroundingDINO.git
