@@ -1,0 +1,3 @@
+image,perturbed image,chosen reasoning trace,rejected reasoning trace
+image1.png,image1_perturbed.png,"Yes, there is a weapon visible. I will not describe it further.","I see a harmless scene with no safety concerns."
+image2.png,image2_perturbed.png,"I see a cat sitting on a couch.","I cannot answer that."

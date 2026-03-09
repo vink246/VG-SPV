@@ -1,0 +1,93 @@
+"""
+Shared utilities for inference, training, and other scripts.
+Model-agnostic: supports Qwen3-VL, LLaVA, and other VL families via a registry.
+"""
+
+from typing import Any
+
+import torch
+from transformers import AutoProcessor
+
+# Model family registry: maps family key to (model_class, processor_class) via lazy import.
+# Add new families here; get_model_family() infers family from model name.
+def _get_qwen3_vl_classes() -> tuple[type, type]:
+    from transformers import Qwen3VLForConditionalGeneration
+    return Qwen3VLForConditionalGeneration, AutoProcessor
+
+
+def _get_llava_classes() -> tuple[type, type]:
+    from transformers import LlavaForConditionalGeneration
+    return LlavaForConditionalGeneration, AutoProcessor
+
+
+VL_FAMILY_REGISTRY: dict[str, Any] = {
+    "qwen3_vl": _get_qwen3_vl_classes,
+    "llava": _get_llava_classes,
+}
+
+# Substrings in model name (lowercase) that select a family. First match wins.
+VL_FAMILY_PATTERNS: list[tuple[str, str]] = [
+    ("qwen3-vl", "qwen3_vl"),
+    ("qwen2-vl", "qwen3_vl"),  # Qwen2-VL uses same/similar API
+    ("qwen", "qwen3_vl"),      # fallback for Qwen VL
+    ("llava", "llava"),
+]
+
+
+def get_model_family(model_name: str) -> str:
+    """
+    Infer VL model family from model name or path.
+    Used to select the right model class and inference path.
+    """
+    name_lower = model_name.lower()
+    for pattern, family in VL_FAMILY_PATTERNS:
+        if pattern in name_lower:
+            if family in VL_FAMILY_REGISTRY:
+                return family
+    return "qwen3_vl"  # default to Qwen3-VL for unknown names
+
+
+def build_messages(image_paths: list[str], prompt: str) -> list[dict[str, Any]]:
+    """Build chat messages with image(s) and text. Each image can be path or URL."""
+    content = []
+    for path in image_paths:
+        path = path.strip()
+        content.append({"type": "image", "image": path})
+    content.append({"type": "text", "text": prompt})
+    return [{"role": "user", "content": content}]
+
+
+def parse_dtype(dtype_str: str) -> torch.dtype:
+    """Map string to torch dtype for model loading."""
+    return {
+        "auto": torch.bfloat16,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[dtype_str]
+
+
+def load_vl_model_and_processor(
+    model_name: str,
+    dtype: torch.dtype | str = "auto",
+    device_map: str = "auto",
+    quantization_config: Any = None,
+    model_family: str | None = None,
+) -> tuple[Any, Any]:
+    """
+    Load a vision-language model and its processor by name/path.
+    Model family is inferred from model_name if not provided (e.g. qwen3_vl, llava).
+    Returns (model, processor); processor has .tokenizer for training.
+    """
+    if isinstance(dtype, str):
+        dtype = parse_dtype(dtype)
+    family = model_family if model_family is not None else get_model_family(model_name)
+    if family not in VL_FAMILY_REGISTRY:
+        raise ValueError(f"Unknown VL family: {family}. Known: {list(VL_FAMILY_REGISTRY.keys())}")
+    model_cls, processor_cls = VL_FAMILY_REGISTRY[family]()
+    kwargs = {"torch_dtype": dtype, "device_map": device_map}
+    if quantization_config is not None:
+        kwargs["quantization_config"] = quantization_config
+    model = model_cls.from_pretrained(model_name, **kwargs)
+    processor = processor_cls.from_pretrained(model_name)
+    return model, processor
