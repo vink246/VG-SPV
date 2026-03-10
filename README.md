@@ -42,7 +42,7 @@ VG-SPV/
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/<your-org>/VG-SPV.git
+git clone https://github.com/vink246/VG-SPV.git
 cd VG-SPV
 ```
 
