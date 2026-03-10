@@ -6,7 +6,7 @@ Usage:
     python inference/run_inference.py --model Qwen/Qwen3-VL-4B-Instruct --image img.png --prompt "What is in this image?" --output response.txt
     python inference/run_inference.py --model llava-hf/llava-1.5-7b-hf --image img.png --prompt "Describe this image"
 
-Make sure toset the Hugging Face cache to a directory with enough space (e.g. scratch): export HF_HOME=~/scratch/.cache/huggingface
+Make sure to set the Hugging Face cache to a directory with enough space (e.g. scratch): export HF_HOME=~/scratch/.cache/huggingface
 """
 
 import argparse
