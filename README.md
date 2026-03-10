@@ -12,27 +12,27 @@ Built for a research project in CS 8803 (LLMs) at Georgia Tech.
 
 ```
 VG-SPV/
-├── data/                  # Scripts to download/process COCO, VLGuard, VisCRA; sample CSV
-│   ├── generate_traces.py # GPT-4o API script for synthesizing data
-│   └── sample_dpo_data.csv # Example CSV (image, perturbed image, chosen/rejected reasoning trace)
-├── eval/                  # Scripts for running VisCRA ASR and RefCOCO benchmarks
-├── inference/             # Scripts to query the model (no training)
-│   ├── run_inference.py   # VL image + text inference (use --model to choose model)
-│   └── utils.py           # Inference-only helpers (e.g. run_vl_inference)
-├── models/                # VG-PRM reward logic and TinyLLaVA model wrappers
-│   └── reward_dino.py     # Grounding DINO IoU-based reward computation
-├── scripts/               # Bash scripts for launching training/eval runs
-│   ├── run_dpo_train.sh       # Launch DPO training
-│   ├── install_grounding_dino.sh # Install Grounding DINO after env create
-│   └── install_flash_attn.sh    # Install flash-attn after env create (optional)
-├── train/                 # DPO pipeline (TRL DPOTrainer) and VG-fDPO loss stub
-│   ├── dpo_trainer.py     # VGSPVTrainer (override compute_loss for VG-fDPO)
-│   ├── dataset_adapter.py # DPO dataset contract and CSV loader (image, perturbed_image, chosen/rejected reasoning traces)
-│   └── run_dpo.py         # DPO training entrypoint
-├── utils.py               # Shared, model-agnostic helpers (VL registry, load_vl_model_and_processor, build_messages, parse_dtype)
-├── environment.yml        # Dependencies (torch, transformers, groundingdino, etc.)
-├── README.md              # This file
-└── LICENSE                # Apache 2.0
+├── data/                          # Scripts to download/process COCO, VLGuard, VisCRA; sample CSV
+│   ├── generate_traces.py         # GPT-4o API script for synthesizing data
+│   └── sample_dpo_data.csv        # Example CSV (image, perturbed image, chosen/rejected reasoning trace)
+├── eval/                          # Scripts for running VisCRA ASR and RefCOCO benchmarks
+├── inference/                     # Scripts to query the model (no training)
+│   ├── run_inference.py           # VL image + text inference (use --model to choose model)
+│   └── utils.py                   # Inference-only helpers (e.g. run_vl_inference)
+├── models/                        # VG-PRM reward logic and TinyLLaVA model wrappers
+│   └── reward_dino.py             # Grounding DINO IoU-based reward computation
+├── scripts/                       # Bash scripts for launching training/eval runs
+│   ├── run_dpo_train.sh           # Launch DPO training
+│   ├── install_grounding_dino.sh  # Install Grounding DINO after env create
+│   └── install_flash_attn.sh      # Install flash-attn after env create (optional)
+├── train/                         # DPO pipeline (TRL DPOTrainer) and VG-fDPO loss stub
+│   ├── dpo_trainer.py             # VGSPVTrainer (override compute_loss for VG-fDPO)
+│   ├── dataset_adapter.py         # DPO dataset contract and CSV loader (image, perturbed_image, chosen/rejected reasoning traces)
+│   └── run_dpo.py                 # DPO training entrypoint
+├── utils.py                       # Shared, model-agnostic helpers (VL registry, load_vl_model_and_processor, build_messages, parse_dtype)
+├── environment.yml                # Dependencies (torch, transformers, groundingdino, etc.)
+├── README.md                      # This file
+└── LICENSE                        # Apache 2.0
 ```
 
 ---
