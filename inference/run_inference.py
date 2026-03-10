@@ -56,6 +56,10 @@ def main():
         os.environ["HUGGINGFACE_HUB_CACHE"] = args.cache_dir
 
     dtype = parse_dtype(args.dtype)
+    # Match huggingface_hub resolution: HUGGINGFACE_HUB_CACHE else $HF_HOME/hub (HF_HOME defaults to ~/.cache/huggingface)
+    hf_home = os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+    cache_dir = os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(hf_home, "hub"))
+    print(f"Model cache dir: {cache_dir}")
     print(f"Loading model {args.model}...")
     model, processor = load_vl_model_and_processor(args.model, dtype=dtype)
 
