@@ -22,8 +22,9 @@ VG-SPV/
 ├── models/                # VG-PRM reward logic and TinyLLaVA model wrappers
 │   └── reward_dino.py     # Grounding DINO IoU-based reward computation
 ├── scripts/               # Bash scripts for launching training/eval runs
-│   ├── run_dpo_train.sh   # Launch DPO training
-│   └── install_grounding_dino.sh # Install Grounding DINO after env create
+│   ├── run_dpo_train.sh       # Launch DPO training
+│   ├── install_grounding_dino.sh # Install Grounding DINO after env create
+│   └── install_flash_attn.sh    # Install flash-attn after env create (optional)
 ├── train/                 # DPO pipeline (TRL DPOTrainer) and VG-fDPO loss stub
 │   ├── dpo_trainer.py     # VGSPVTrainer (override compute_loss for VG-fDPO)
 │   ├── dataset_adapter.py # DPO dataset contract and CSV loader (image, perturbed_image, chosen/rejected reasoning traces)
@@ -59,20 +60,26 @@ conda env create --prefix ~/scratch/envs/vg-spv -f environment.yml
 conda activate ~/scratch/envs/vg-spv
 ```
 
-### 3. Install Grounding DINO (required for VG-PRM reward)
+### 3. Install packages that need the env’s PyTorch at build time
 
-Grounding DINO must be installed **after** the env is created so its build can see the conda-installed PyTorch (pip’s build isolation would otherwise fail):
+Grounding DINO (and optionally flash-attn) must be installed **after** the env is created so their builds see the conda-installed PyTorch (pip’s build isolation would otherwise fail).
+
+**Grounding DINO** (required for VG-PRM reward):
 
 ```bash
 pip install --no-build-isolation 'git+https://github.com/IDEA-Research/GroundingDINO.git'
+# or:
+bash scripts/install_grounding_dino.sh
+bash scripts/install_grounding_dino.sh ~/scratch/envs/vg-spv   # prefix env
 ```
 
-Or use the helper script (with env activated, or pass the env path):
+**Flash Attention** (optional, for Qwen-VL memory efficiency; slow to build):
 
 ```bash
-bash scripts/install_grounding_dino.sh
-# or, for a prefix env:
-bash scripts/install_grounding_dino.sh ~/scratch/envs/vg-spv
+pip install --no-build-isolation flash-attn
+# or:
+bash scripts/install_flash_attn.sh
+bash scripts/install_flash_attn.sh ~/scratch/envs/vg-spv       # prefix env
 ```
 
 ### 4. Dependencies
@@ -82,8 +89,8 @@ The `environment.yml` includes:
 - **Python 3.10**, PyTorch (CUDA 12.1), torchvision, torchaudio  
 - **Transformers**, Accelerate, PEFT, TRL, Datasets  
 - **VL models**: Inference and training are model-agnostic. Supported families include **Qwen3-VL** (e.g. 2B, 4B, 8B) and **LLaVA**; add more in `utils.py` via the VL family registry.  
-- **Grounding DINO** (from source) for spatial reward computation  
-- **Flash Attention** (optional, for Qwen-VL memory efficiency)  
+- **Grounding DINO** (from source) for spatial reward computation — install after env create: `bash scripts/install_grounding_dino.sh`.  
+- **Flash Attention** (optional, for Qwen-VL memory efficiency) — install after env create: `bash scripts/install_flash_attn.sh`.  
 
 Ensure you have a CUDA-capable GPU and enough VRAM for training/eval.
 

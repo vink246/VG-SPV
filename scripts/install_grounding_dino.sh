@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install GroundingDINO after the conda env is created.
+# Install Grounding DINO (requires conda's PyTorch at build time).
 # Run with the vg-spv env activated, or pass conda env path.
 # Usage: bash scripts/install_grounding_dino.sh
 #    or: bash scripts/install_grounding_dino.sh ~/scratch/envs/vg-spv

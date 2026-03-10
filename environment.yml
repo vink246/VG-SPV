@@ -25,7 +25,6 @@ dependencies:
       - trl
       - datasets
       - qwen-vl-utils
-      # Flash Attention for Qwen-VL memory efficiency
-      - flash-attn
-      # GroundingDINO: install after env create (see scripts/install_grounding_dino.sh)
-      # pip install --no-build-isolation git+https://github.com/IDEA-Research/GroundingDINO.git
+      # Install after env create with --no-build-isolation (see scripts/):
+      # - scripts/install_grounding_dino.sh  (Grounding DINO)
+      # - scripts/install_flash_attn.sh      (optional, flash-attn)
