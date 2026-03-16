@@ -1,9 +1,9 @@
 """
-Run vision-language inference with any supported model (Qwen3-VL, LLaVA, etc.).
+Run vision-language inference with any supported model (TinyLLaVA, LLaVA, etc.).
 
 Usage:
-    python inference/run_inference.py --model Qwen/Qwen3-VL-2B-Instruct --image path/to/img.png --prompt "Describe this image"
-    python inference/run_inference.py --model Qwen/Qwen3-VL-4B-Instruct --image img.png --prompt "What is in this image?" --output response.txt
+    python inference/run_inference.py --model tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B --image path/to/img.png --prompt "Describe this image"
+    python inference/run_inference.py --model tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B --image img.png --prompt "What is in this image?" --output response.txt
     python inference/run_inference.py --model llava-hf/llava-1.5-7b-hf --image img.png --prompt "Describe this image"
 
 Make sure to set the Hugging Face cache to a directory with enough space (e.g. scratch): export HF_HOME=~/scratch/.cache/huggingface
@@ -35,7 +35,12 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Run VL inference on image + text. Use --model to choose the model."
     )
-    p.add_argument("--model", type=str, default="Qwen/Qwen3-VL-2B-Instruct", help="Model name or path (e.g. Qwen/Qwen3-VL-2B-Instruct, Qwen/Qwen3-VL-4B-Instruct, llava-hf/llava-1.5-7b-hf)")
+    p.add_argument(
+        "--model",
+        type=str,
+        default="tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B",
+        help="Model name or path (e.g. tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B, llava-hf/llava-1.5-7b-hf)",
+    )
     p.add_argument("--image", type=str, required=True, help="Path to input image (or comma-separated paths)")
     p.add_argument("--prompt", type=str, default="Describe this image.", help="Text prompt for the model")
     p.add_argument("--output", type=str, default=None, help="Optional path to save response text")
