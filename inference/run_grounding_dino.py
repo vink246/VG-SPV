@@ -202,6 +202,46 @@ def _patch_bert_get_head_mask_for_grounding_dino() -> None:
     BertModel.get_head_mask = get_head_mask
 
 
+def _model_floating_dtype(module: Any) -> torch.dtype:
+    """First floating dtype of module parameters (for attention mask casting)."""
+    if hasattr(module, "dtype") and module.dtype is not None:
+        d = module.dtype
+        if isinstance(d, torch.dtype) and d.is_floating_point:
+            return d
+    try:
+        from transformers.modeling_utils import get_parameter_dtype
+
+        return get_parameter_dtype(module)
+    except Exception:
+        for p in module.parameters():
+            if p.dtype.is_floating_point:
+                return p.dtype
+        return torch.float32
+
+
+def _patch_bert_get_extended_attention_mask_for_grounding_dino() -> None:
+    """
+    GroundingDINO's bertwarper calls ``get_extended_attention_mask(attention_mask, input_shape, device)``.
+    Newer ``transformers`` use a third argument ``dtype`` (not ``device``). A ``torch.device`` is then
+    mistaken for ``dtype``, causing ``.to(dtype=...)`` to fail. Map device-as-third-arg to model dtype.
+    """
+    from transformers.models.bert.modeling_bert import BertModel
+    from transformers.modeling_utils import PreTrainedModel
+
+    if getattr(BertModel, "_grounding_dino_extended_mask_patched", False):
+        return
+
+    _orig = PreTrainedModel.get_extended_attention_mask
+
+    def get_extended_attention_mask(self, attention_mask, input_shape, dtype=None, **kwargs):
+        if dtype is not None and isinstance(dtype, torch.device):
+            dtype = _model_floating_dtype(self)
+        return _orig(self, attention_mask, input_shape, dtype=dtype, **kwargs)
+
+    BertModel.get_extended_attention_mask = get_extended_attention_mask
+    BertModel._grounding_dino_extended_mask_patched = True
+
+
 def load_grounding_dino_model(
     config_path: str,
     checkpoint_path: str,
@@ -212,6 +252,7 @@ def load_grounding_dino_model(
     Requires `groundingdino` to be installed.
     """
     _patch_bert_get_head_mask_for_grounding_dino()
+    _patch_bert_get_extended_attention_mask_for_grounding_dino()
     try:
         from groundingdino.util.inference import Model
     except ImportError as exc:

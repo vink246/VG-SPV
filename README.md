@@ -130,10 +130,12 @@ installed package based on the checkpoint filename (e.g. `groundingdino_swint_og
   The script generates JSON box annotations (and an optional visualization) for use with
   `models/reward_dino.py` or other data-processing pipelines.
 
-  **Transformers compatibility:** Upstream GroundingDINO expects `BertModel.get_head_mask`, which
-  some newer `transformers` releases omit. `inference/run_grounding_dino.py` applies a small
-  compatibility patch before loading the model. If you still see BERT-related errors, try pinning
-  `transformers` to a version known to work with GroundingDINO (e.g. `4.41.x`).
+  **Transformers compatibility:** Upstream GroundingDINO targets an older `transformers` API.
+  `inference/run_grounding_dino.py` applies small patches before loading: it restores
+  `BertModel.get_head_mask` if missing, and fixes `get_extended_attention_mask` when the third
+  argument is a `torch.device` (GroundingDINO) but newer `transformers` expect a `dtype` there.
+  If you still see BERT-related errors, try pinning `transformers` to a version known to work with
+  GroundingDINO (e.g. `4.41.x`).
 
 ### 6. (Optional) API keys and data
 
