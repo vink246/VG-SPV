@@ -18,6 +18,7 @@ VG-SPV/
 ├── eval/                          # Scripts for running VisCRA ASR and RefCOCO benchmarks
 ├── inference/                     # Scripts to query the model (no training)
 │   ├── run_inference.py           # VL image + text inference (use --model to choose model)
+│   ├── run_grounding_dino.py      # Grounding DINO inference for box supervision / GT generation
 │   └── utils.py                   # Inference-only helpers (e.g. run_vl_inference)
 ├── models/                        # VG-PRM reward logic and TinyLLaVA model wrappers
 │   └── reward_dino.py             # Grounding DINO IoU-based reward computation
@@ -73,6 +74,11 @@ bash scripts/install_grounding_dino.sh
 bash scripts/install_grounding_dino.sh ~/scratch/envs/vg-spv   # prefix env
 ```
 
+After installation, the `groundingdino` package ships with model configs. When you run
+`inference/run_grounding_dino.py`, the script **automatically selects the matching config**
+from the checkpoint filename (e.g. `groundingdino_swint_ogc.pth` → `GroundingDINO_SwinT_OGC.py`).
+You can override with `--config` if needed.
+
 **Flash Attention** (optional, for Qwen-VL memory efficiency; slow to build):
 
 ```bash
@@ -94,7 +100,36 @@ The `environment.yml` includes:
 
 Ensure you have a CUDA-capable GPU and enough VRAM for training/eval.
 
-### 5. (Optional) API keys and data
+### 5. Grounding DINO weights and configs
+
+Once `groundingdino` is installed (see above), you only need a **pretrained checkpoint** to run
+`inference/run_grounding_dino.py`. The script **automatically picks the right config** from the
+installed package based on the checkpoint filename (e.g. `groundingdino_swint_ogc.pth` →
+`GroundingDINO_SwinT_OGC.py`). Use `--config` only if you need to override.
+
+- **Download pretrained weights**  
+  GroundingDINO publishes weights on their [GitHub](https://github.com/IDEA-Research/GroundingDINO) (and mirrors). Typical checkpoints:
+
+  - `groundingdino_swint_ogc.pth` (Swin-T backbone, OGC)
+  - `groundingdino_swinb_cogcoor.pth` (Swin-B backbone, CogCoor)
+
+  Download the `.pth` file to a directory of your choice (e.g. `checkpoints/`).
+
+- **Run Grounding DINO inference for GT generation**:
+
+  ```bash
+  python inference/run_grounding_dino.py \
+    --checkpoint path/to/groundingdino_swint_ogc.pth \
+    --image path/to/image.jpg \
+    --text-prompt "dog . person ." \
+    --output-json outputs/dino_boxes.json \
+    --output-viz outputs/dino_boxes_viz.jpg
+  ```
+
+  The script generates JSON box annotations (and an optional visualization) for use with
+  `models/reward_dino.py` or other data-processing pipelines.
+
+### 6. (Optional) API keys and data
 
 - For `data/generate_traces.py`: set your **OpenAI API key** (GPT-4o) if synthesizing traces.  
 - Download or configure paths for **COCO**, **VLGuard**, and **VisCRA** datasets as required by the data scripts.
@@ -124,7 +159,7 @@ Training data is stored as **CSV** files with the following columns (headers may
 1. **Inference**: Run `inference/run_inference.py` with `--model` to query any supported VL model (e.g. TinyLLaVA, LLaVA). Example: `python inference/run_inference.py --model tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B --image path/to/img.png --prompt "Describe this image"`. If you see **"Disk quota exceeded"**, the Hugging Face model cache is on a full filesystem: set the cache to a directory with space (e.g. scratch) with `export HF_HOME=~/scratch/.cache/huggingface` before running, or use `--cache_dir ~/scratch/.cache/huggingface/hub`. The script also auto-uses `$SCRATCH` for the cache when set.
 2. **Data**: Run `data/generate_traces.py` to download/process datasets and synthesize traces. Output should match the [dataset format](#dataset-format) (CSV: image, perturbed image, chosen reasoning trace, rejected reasoning trace).
 3. **Training**: Use scripts in `scripts/` to launch VG-fDPO training (e.g. `bash scripts/run_dpo_train.sh`). Use `--model_name` to pick any supported VL model. The `train/` directory contains the DPO pipeline (TRL DPOTrainer) with a custom trainer stub for VG-fDPO loss.
-4. **Reward**: `models/reward_dino.py` provides the Grounding DINO IoU-based reward for VG-PRM.
+4. **Reward**: `models/reward_dino.py` provides the Grounding DINO IoU-based reward for VG-PRM. For ground-truth box generation, run `inference/run_grounding_dino.py` with `--checkpoint` (config is auto-selected from the checkpoint name).
 5. **Eval**: Run VisCRA ASR and RefCOCO benchmarks from `eval/`.
 
 ---
