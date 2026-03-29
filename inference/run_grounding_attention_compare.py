@@ -119,11 +119,9 @@ def sliding_window_argmax_box(
     stride: int,
     img_h: int,
     img_w: int,
-    top_k: int = 3,
-    rng: np.random.Generator | None = None,
 ) -> tuple[float, float, float, float]:
     """
-    VisCRA-style: score = sum of heat in each BxB window; pick randomly among top-k patches (arXiv:2505.19684).
+    Score = sum of heat in each BxB window (VisCRA-style patch aggregation); pick the single best window.
     Returns xyxy in pixel coordinates relative to full image.
     """
     h, w = heat2d.shape
@@ -138,17 +136,96 @@ def sliding_window_argmax_box(
     best_scores.sort(key=lambda t: t[0], reverse=True)
     if not best_scores:
         return 0.0, 0.0, float(img_w), float(img_h)
-    k = min(top_k, len(best_scores))
-    pick = 0
-    if rng is not None and k > 1:
-        pick = int(rng.integers(0, k))
-    _, y0, x0 = best_scores[pick]
+    _, y0, x0 = best_scores[0]
     # Map patch grid coords to image pixels
     px1 = x0 / max(w, 1) * img_w
     py1 = y0 / max(h, 1) * img_h
     px2 = (x0 + window) / max(w, 1) * img_w
     py2 = (y0 + window) / max(h, 1) * img_h
     return px1, py1, px2, py2
+
+
+def connected_component_box(
+    heat2d: np.ndarray,
+    img_h: int,
+    img_w: int,
+    *,
+    threshold_percentile: float = 75.0,
+    blur_sigma: float = 0.0,
+) -> tuple[float, float, float, float]:
+    """
+    Threshold heatmap at the given percentile, take the largest 8-connected component,
+    return its axis-aligned bbox in pixel xyxy.
+    """
+    import cv2
+
+    h, w = heat2d.shape
+    work = heat2d.astype(np.float32)
+    if blur_sigma > 0:
+        k = max(3, int(round(blur_sigma * 4)) | 1)
+        work = cv2.GaussianBlur(work, (k, k), blur_sigma)
+    thr = float(np.percentile(work, np.clip(threshold_percentile, 0.0, 100.0)))
+    mask = ((work >= thr).astype(np.uint8)) * 255
+    n, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n <= 1:
+        return 0.0, 0.0, float(img_w), float(img_h)
+    best_j = 1
+    best_area = int(stats[1, cv2.CC_STAT_AREA])
+    for j in range(2, n):
+        a = int(stats[j, cv2.CC_STAT_AREA])
+        if a > best_area:
+            best_area = a
+            best_j = j
+    x = int(stats[best_j, cv2.CC_STAT_LEFT])
+    y = int(stats[best_j, cv2.CC_STAT_TOP])
+    bw = int(stats[best_j, cv2.CC_STAT_WIDTH])
+    bh = int(stats[best_j, cv2.CC_STAT_HEIGHT])
+    px1 = x / max(w, 1) * img_w
+    py1 = y / max(h, 1) * img_h
+    px2 = (x + bw) / max(w, 1) * img_w
+    py2 = (y + bh) / max(h, 1) * img_h
+    return px1, py1, px2, py2
+
+
+def multiscale_sliding_window_box(
+    heat2d: np.ndarray,
+    img_h: int,
+    img_w: int,
+    window_sizes: list[int],
+    stride: int,
+    area_power: float = 0.5,
+) -> tuple[float, float, float, float, int]:
+    """
+    Search square windows over several sizes; score = sum(heat) / (area ** area_power).
+    area_power=0 recovers raw sum (favors large windows); 1.0 is mean pooling.
+    Returns (px1, py1, px2, py2, winning_window_side).
+    """
+    h, w = heat2d.shape
+    sizes = sorted({max(1, int(s)) for s in window_sizes})
+    best_score = -1.0
+    best: tuple[int, int, int] | None = None  # y0, x0, win
+
+    for window in sizes:
+        win = min(window, h, w)
+        st = max(1, min(stride, win))
+        for y0 in range(0, h - win + 1, st):
+            for x0 in range(0, w - win + 1, st):
+                ssum = float(heat2d[y0 : y0 + win, x0 : x0 + win].sum())
+                area = float(win * win)
+                denom = area**area_power if area > 0 else 1.0
+                score = ssum / denom
+                if score > best_score:
+                    best_score = score
+                    best = (y0, x0, win)
+
+    if best is None:
+        return 0.0, 0.0, float(img_w), float(img_h), min(h, w)
+    y0, x0, window = best
+    px1 = x0 / max(w, 1) * img_w
+    py1 = y0 / max(h, 1) * img_h
+    px2 = (x0 + window) / max(w, 1) * img_w
+    py2 = (y0 + window) / max(h, 1) * img_h
+    return px1, py1, px2, py2, window
 
 
 def find_grounding_token_steps(
@@ -195,8 +272,13 @@ def save_attention_heatmap_overlay(
     out_path: Path,
     *,
     alpha: float = 0.45,
+    percentile_clip: float = 90.0,
+    gamma: float = 0.55,
 ) -> None:
-    """Upsample normalized heat2d to image size, JET colormap, blend over BGR image, write PNG."""
+    """
+    Upsample heat2d to image size, soften contrast (clip high percentiles, gamma), JET, blend, write PNG.
+    gamma < 1 lifts mid-level mass so the map is easier to read than min-max alone.
+    """
     import cv2
 
     bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
@@ -204,8 +286,17 @@ def save_attention_heatmap_overlay(
         raise FileNotFoundError(f"Could not read image: {image_path}")
     h, w = bgr.shape[:2]
     hm = cv2.resize(heat2d.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
-    hm = np.clip(hm, 0.0, 1.0)
-    hm_u8 = (hm * 255.0).astype(np.uint8)
+    hm = np.clip(hm, 0.0, None)
+    pc = float(np.clip(percentile_clip, 50.0, 100.0))
+    hi = float(np.percentile(hm, pc))
+    if hi > hm.min():
+        hm = np.minimum(hm, hi)
+    hm = hm - hm.min()
+    denom = float(hm.max()) if hm.max() > 0 else 1.0
+    hm = hm / denom
+    g = float(np.clip(gamma, 0.15, 1.0))
+    hm = np.power(hm, g)
+    hm_u8 = (np.clip(hm, 0.0, 1.0) * 255.0).astype(np.uint8)
     colored = cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET)
     blended = (alpha * colored.astype(np.float32) + (1.0 - alpha) * bgr.astype(np.float32)).astype(
         np.uint8
@@ -226,8 +317,11 @@ def run_mllama_with_grounding_attention(
     do_sample: bool,
     window: int,
     stride: int,
-    top_k_patches: int,
-    seed: int,
+    box_strategy: str = "viscra",
+    cc_percentile: float = 75.0,
+    cc_blur_sigma: float = 0.0,
+    multiscale_windows: list[int] | None = None,
+    multiscale_area_power: float = 0.5,
 ) -> tuple[str, np.ndarray, dict[str, Any], np.ndarray]:
     from PIL import Image
     from transformers import AutoProcessor, MllamaForConditionalGeneration
@@ -335,11 +429,45 @@ def run_mllama_with_grounding_attention(
     if heat2d.max() > 0:
         heat2d = heat2d / heat2d.max()
 
-    rng = np.random.default_rng(seed)
-    x1, y1, x2, y2 = sliding_window_argmax_box(
-        heat2d, window, stride, img_h, img_w, top_k=top_k_patches, rng=rng
-    )
-    box = np.array([x1, y1, x2, y2], dtype=np.float32)
+    ms_sizes = multiscale_windows if multiscale_windows is not None else [4, 6, 8, 12, 16, 20, 24]
+
+    if box_strategy == "viscra":
+        x1, y1, x2, y2 = sliding_window_argmax_box(heat2d, window, stride, img_h, img_w)
+        box = np.array([x1, y1, x2, y2], dtype=np.float32)
+        box_meta: dict[str, Any] = {"box_strategy": "viscra", "window": window, "stride": stride}
+    elif box_strategy == "connected":
+        x1, y1, x2, y2 = connected_component_box(
+            heat2d,
+            img_h,
+            img_w,
+            threshold_percentile=cc_percentile,
+            blur_sigma=cc_blur_sigma,
+        )
+        box = np.array([x1, y1, x2, y2], dtype=np.float32)
+        box_meta = {
+            "box_strategy": "connected",
+            "cc_percentile": cc_percentile,
+            "cc_blur_sigma": cc_blur_sigma,
+        }
+    elif box_strategy == "multiscale":
+        x1, y1, x2, y2, win_side = multiscale_sliding_window_box(
+            heat2d,
+            img_h,
+            img_w,
+            ms_sizes,
+            stride,
+            area_power=multiscale_area_power,
+        )
+        box = np.array([x1, y1, x2, y2], dtype=np.float32)
+        box_meta = {
+            "box_strategy": "multiscale",
+            "multiscale_windows": list(ms_sizes),
+            "multiscale_area_power": multiscale_area_power,
+            "multiscale_winning_side": int(win_side),
+            "stride": stride,
+        }
+    else:
+        raise ValueError(f"Unknown box_strategy: {box_strategy!r}")
 
     meta = {
         "cross_attn_layer_index": idx,
@@ -349,6 +477,7 @@ def run_mllama_with_grounding_attention(
         "vision_tokens": int(attn_mean.shape[0]),
         "heatmap_shape": list(heat2d.shape),
         "image_hw": [img_h, img_w],
+        **box_meta,
     }
     return full_response, box, meta, heat2d
 
@@ -393,6 +522,11 @@ def draw_overlay(
     return bgr
 
 
+def _parse_comma_ints(s: str) -> list[int]:
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    return [int(x) for x in parts]
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="MLLM grounding via cross-attention vs Grounding DINO (VisCRA-style relevance)."
@@ -422,12 +556,49 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--window", type=int, default=12, help="Sliding window size on heatmap grid (VisCRA default 12)")
     p.add_argument("--stride", type=int, default=4, help="Sliding window stride (VisCRA default 4)")
     p.add_argument(
-        "--top-k-patches",
-        type=int,
-        default=3,
-        help="Randomly pick among top-k scoring windows (VisCRA uses top 3)",
+        "--box-strategy",
+        type=str,
+        default="viscra",
+        choices=["viscra", "connected", "multiscale"],
+        help="How to turn the attention heatmap into a box: viscra=fixed window+top-k; "
+        "connected=largest component above percentile; multiscale=best square among several sizes",
     )
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--cc-percentile",
+        type=float,
+        default=75.0,
+        help="connected: pixels >= this percentile form the mask (higher = stricter / smaller regions)",
+    )
+    p.add_argument(
+        "--cc-blur-sigma",
+        type=float,
+        default=0.0,
+        help="connected: Gaussian blur sigma on heatmap before threshold (0 = off)",
+    )
+    p.add_argument(
+        "--multiscale-windows",
+        type=str,
+        default="4,6,8,12,16,20,24",
+        help="multiscale: comma-separated square window sizes on the patch grid",
+    )
+    p.add_argument(
+        "--multiscale-area-power",
+        type=float,
+        default=0.5,
+        help="multiscale: score = sum / area**p (0=raw sum favors large, 1=mean favors compact peaks)",
+    )
+    p.add_argument(
+        "--heatmap-percentile-clip",
+        type=float,
+        default=90.0,
+        help="Saved heatmap: clip intensities at this percentile before stretching colormap (softer peaks)",
+    )
+    p.add_argument(
+        "--heatmap-gamma",
+        type=float,
+        default=0.55,
+        help="Saved heatmap: apply gamma after clip (<1 brightens mid-level mass for readability)",
+    )
     p.add_argument("--sample", action="store_true", help="Use sampling for generation")
     p.add_argument("--dino-checkpoint", type=str, default=None, help="Grounding DINO .pth (optional)")
     p.add_argument("--dino-config", type=str, default=None, help="Override DINO config .py path")
@@ -467,6 +638,9 @@ def main() -> None:
     dtype = parse_dtype(args.dtype)
 
     print("Loading Mllama with attn_implementation=eager (required for cross-attention weights)...")
+    multiscale_list = _parse_comma_ints(args.multiscale_windows)
+    if args.box_strategy == "multiscale" and not multiscale_list:
+        raise ValueError("--multiscale-windows must contain at least one integer (comma-separated).")
     response, mllm_box, meta, attn_heat2d = run_mllama_with_grounding_attention(
         args.model,
         messages,
@@ -477,8 +651,11 @@ def main() -> None:
         do_sample=args.sample,
         window=args.window,
         stride=args.stride,
-        top_k_patches=args.top_k_patches,
-        seed=args.seed,
+        box_strategy=args.box_strategy,
+        cc_percentile=args.cc_percentile,
+        cc_blur_sigma=args.cc_blur_sigma,
+        multiscale_windows=multiscale_list,
+        multiscale_area_power=args.multiscale_area_power,
     )
 
     print("--- Model response ---")
@@ -546,7 +723,13 @@ def main() -> None:
         if args.output_heatmap
         else out_path.with_name(f"{out_path.stem}_attention_heatmap.png")
     )
-    save_attention_heatmap_overlay(str(img_path), attn_heat2d, heatmap_path)
+    save_attention_heatmap_overlay(
+        str(img_path),
+        attn_heat2d,
+        heatmap_path,
+        percentile_clip=args.heatmap_percentile_clip,
+        gamma=args.heatmap_gamma,
+    )
     print(f"Saved attention heatmap to {heatmap_path}")
 
 
