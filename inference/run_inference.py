@@ -27,8 +27,8 @@ if "HUGGINGFACE_HUB_CACHE" not in os.environ and "HF_HOME" not in os.environ:
         hf_cache.mkdir(parents=True, exist_ok=True)
         os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_cache)
 
-from inference.utils import run_vl_inference
-from utils import build_messages, load_vl_model_and_processor, parse_dtype
+from utils import build_messages, parse_dtype
+from vlm import load_vlm, run_vl_inference
 
 
 def parse_args():
@@ -47,6 +47,13 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=1024, help="Max new tokens to generate")
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16"], help="Model dtype")
     p.add_argument("--cache_dir", type=str, default=None, help="Override Hugging Face cache dir (default: use HF_HOME / SCRATCH)")
+    p.add_argument(
+        "--model-family",
+        type=str,
+        default=None,
+        choices=["qwen3_vl", "llava", "tinyllava", "mllama"],
+        help="Force VLM backend (optional). If omitted, family is inferred from the model id / config.",
+    )
     return p.parse_args()
 
 
@@ -66,14 +73,10 @@ def main():
     cache_dir = os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(hf_home, "hub"))
     print(f"Model cache dir: {cache_dir}")
     print(f"Loading model {args.model}...")
-    model, processor = load_vl_model_and_processor(args.model, dtype=dtype)
+    loaded = load_vlm(args.model, dtype=dtype, model_family=args.model_family)
 
     messages = build_messages(image_paths, args.prompt)
-    response = run_vl_inference(
-        model, processor, messages,
-        max_new_tokens=args.max_new_tokens,
-        model_name=args.model,
-    )
+    response = run_vl_inference(loaded, messages, max_new_tokens=args.max_new_tokens)
 
     print(response)
     if args.output:
