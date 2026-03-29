@@ -12,9 +12,11 @@ Built for a research project in CS 8803 (LLMs) at Georgia Tech.
 
 ```
 VG-SPV/
-├── data/                          # Scripts to download/process COCO, VLGuard, VisCRA; sample CSV
+├── data/                          # Evaluation and training datasets (e.g. HADES, MM Safety Bench, COCO, VLGuard, VisCRA); download/process scripts; sample CSV
 │   ├── generate_traces.py         # GPT-4o API script for synthesizing data
 │   └── sample_dpo_data.csv        # Example CSV (image, perturbed image, chosen/rejected reasoning trace)
+├── weights/                       # Pretrained Grounding DINO checkpoints (see step 5 under Setup)
+├── outputs/                       # Experiment outputs, visualizations, metrics, and other saved results
 ├── eval/                          # Scripts for running VisCRA ASR and RefCOCO benchmarks
 ├── inference/                     # Scripts to query the model (no training)
 │   ├── run_inference.py           # VL image + text inference (use --model to choose model)
@@ -114,13 +116,22 @@ installed package based on the checkpoint filename (e.g. `groundingdino_swint_og
   - `groundingdino_swint_ogc.pth` (Swin-T backbone, OGC)
   - `groundingdino_swinb_cogcoor.pth` (Swin-B backbone, CogCoor)
 
-  Download the `.pth` file to a directory of your choice (e.g. `checkpoints/`).
+  Store checkpoints under the repo’s `weights/` directory (create it if needed). For the default Swin-T OGC weights:
+
+  ```bash
+  mkdir weights
+  cd weights
+  wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
+  cd ..
+  ```
+
+  On Windows without `wget`, download the same URL in a browser or run from `weights/`: `curl -L -o groundingdino_swint_ogc.pth https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth`.
 
 - **Run Grounding DINO inference for GT generation**:
 
   ```bash
   python inference/run_grounding_dino.py \
-    --checkpoint path/to/groundingdino_swint_ogc.pth \
+    --checkpoint weights/groundingdino_swint_ogc.pth \
     --image path/to/image.jpg \
     --text-prompt "dog . person ." \
     --output-json outputs/dino_boxes.json \
@@ -140,7 +151,7 @@ installed package based on the checkpoint filename (e.g. `groundingdino_swint_og
 ### 6. (Optional) API keys and data
 
 - For `data/generate_traces.py`: set your **OpenAI API key** (GPT-4o) if synthesizing traces.  
-- Download or configure paths for **COCO**, **VLGuard**, and **VisCRA** datasets as required by the data scripts.
+- Download or configure paths for datasets under `data/` as required by the scripts (e.g. **HADES**, **MM Safety Bench**, **COCO**, **VLGuard**, **VisCRA**).
 
 ---
 
