@@ -189,6 +189,32 @@ def collect_mllama_cross_attention_modules(model: Any) -> list[Any]:
     return modules
 
 
+def save_attention_heatmap_overlay(
+    image_path: str,
+    heat2d: np.ndarray,
+    out_path: Path,
+    *,
+    alpha: float = 0.45,
+) -> None:
+    """Upsample normalized heat2d to image size, JET colormap, blend over BGR image, write PNG."""
+    import cv2
+
+    bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+    h, w = bgr.shape[:2]
+    hm = cv2.resize(heat2d.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
+    hm = np.clip(hm, 0.0, 1.0)
+    hm_u8 = (hm * 255.0).astype(np.uint8)
+    colored = cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET)
+    blended = (alpha * colored.astype(np.float32) + (1.0 - alpha) * bgr.astype(np.float32)).astype(
+        np.uint8
+    )
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), blended)
+
+
 def run_mllama_with_grounding_attention(
     model_name: str,
     messages: list[dict[str, Any]],
@@ -202,7 +228,7 @@ def run_mllama_with_grounding_attention(
     stride: int,
     top_k_patches: int,
     seed: int,
-) -> tuple[str, np.ndarray, dict[str, Any]]:
+) -> tuple[str, np.ndarray, dict[str, Any], np.ndarray]:
     from PIL import Image
     from transformers import AutoProcessor, MllamaForConditionalGeneration
 
@@ -285,8 +311,15 @@ def run_mllama_with_grounding_attention(
                 "warning": "No cross-attention captures (need eager attn and decode steps with Q=1).",
                 "cross_attn_layer_index": idx,
                 "num_cross_layers": len(cross_mods),
+                "image_hw": [img_h, img_w],
             }
-            return full_response, np.array([0.0, 0.0, float(img_w), float(img_h)]), meta
+            placeholder = np.zeros((1, 1), dtype=np.float32)
+            return (
+                full_response,
+                np.array([0.0, 0.0, float(img_w), float(img_h)]),
+                meta,
+                placeholder,
+            )
         captures = captures[:m]
         new_ids = new_ids[:m]
 
@@ -315,8 +348,9 @@ def run_mllama_with_grounding_attention(
         "num_decode_steps_captured": len(captures),
         "vision_tokens": int(attn_mean.shape[0]),
         "heatmap_shape": list(heat2d.shape),
+        "image_hw": [img_h, img_w],
     }
-    return full_response, box, meta
+    return full_response, box, meta, heat2d
 
 
 def draw_overlay(
@@ -413,6 +447,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Where to save visualization (MLLM red, DINO green)",
     )
+    p.add_argument(
+        "--output-heatmap",
+        type=str,
+        default=None,
+        help="Where to save cross-attention heatmap overlay (PNG). Default: same dir as --output-viz, stem + _attention_heatmap.png",
+    )
     return p.parse_args()
 
 
@@ -427,7 +467,7 @@ def main() -> None:
     dtype = parse_dtype(args.dtype)
 
     print("Loading Mllama with attn_implementation=eager (required for cross-attention weights)...")
-    response, mllm_box, meta = run_mllama_with_grounding_attention(
+    response, mllm_box, meta, attn_heat2d = run_mllama_with_grounding_attention(
         args.model,
         messages,
         dtype=dtype,
@@ -500,6 +540,14 @@ def main() -> None:
     viz = draw_overlay(str(img_path), mllm_box, dino_box, dino_label)
     cv2.imwrite(str(out_path), viz)
     print(f"Saved visualization to {out_path}")
+
+    heatmap_path = (
+        Path(args.output_heatmap)
+        if args.output_heatmap
+        else out_path.with_name(f"{out_path.stem}_attention_heatmap.png")
+    )
+    save_attention_heatmap_overlay(str(img_path), attn_heat2d, heatmap_path)
+    print(f"Saved attention heatmap to {heatmap_path}")
 
 
 if __name__ == "__main__":
