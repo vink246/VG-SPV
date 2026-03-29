@@ -30,6 +30,49 @@ def _prepare_inputs_qwen3_vl(model: Any, processor: Any, messages: list[dict[str
     return _to_device(inputs, model.device)
 
 
+def _prepare_inputs_mllama(model: Any, processor: Any, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Llama 3.2 Vision (Mllama): chat template + images aligned with <|image|> tokens."""
+    from io import BytesIO
+    from pathlib import Path
+
+    import requests
+    from PIL import Image
+
+    content = messages[0]["content"] if messages else []
+    pil_images: list[Any] = []
+    content_for_template: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "image":
+            src = item.get("image")
+            if isinstance(src, str):
+                if src.startswith(("http://", "https://")):
+                    pil_images.append(
+                        Image.open(BytesIO(requests.get(src, timeout=60).content)).convert("RGB")
+                    )
+                else:
+                    pil_images.append(Image.open(Path(src)).convert("RGB"))
+            elif src is not None:
+                pil_images.append(src)
+            content_for_template.append({"type": "image"})
+        elif item.get("type") == "text":
+            content_for_template.append({"type": "text", "text": item.get("text", "")})
+
+    chat_messages = [{"role": "user", "content": content_for_template}]
+    input_text = processor.apply_chat_template(
+        chat_messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    if not pil_images:
+        inputs = processor(text=input_text, return_tensors="pt")
+    else:
+        # One batch item; inner list = images for that sample (see MllamaProcessor).
+        inputs = processor(images=[pil_images], text=input_text, return_tensors="pt")
+    return _to_device(inputs, model.device)
+
+
 def _prepare_inputs_llava(model: Any, processor: Any, messages: list[dict[str, Any]]) -> dict[str, Any]:
     from pathlib import Path
 
@@ -183,6 +226,8 @@ def run_vl_inference(
         inputs = _prepare_inputs_qwen3_vl(model, processor, messages)
     elif family == "llava":
         inputs = _prepare_inputs_llava(model, processor, messages)
+    elif family == "mllama":
+        inputs = _prepare_inputs_mllama(model, processor, messages)
     else:
         raise ValueError(f"No inference path for family: {family}")
 
@@ -193,7 +238,8 @@ def run_vl_inference(
     )
     input_len = inputs["input_ids"].shape[1]
     output_ids = generated_ids[:, input_len:]
-    return processor.batch_decode(
+    tok = getattr(processor, "tokenizer", processor)
+    return tok.batch_decode(
         output_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
@@ -222,7 +268,7 @@ def run_vl_inference_legacy(
     if family == "tinyllava":
         return _run_tinyllava_chat(model, processor, messages, max_new_tokens, do_sample)
 
-    if family not in ("qwen3_vl", "llava"):
+    if family not in ("qwen3_vl", "llava", "mllama"):
         raise ValueError(f"No inference path for family: {family}")
 
     loaded = LoadedVLM(

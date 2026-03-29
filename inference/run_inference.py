@@ -47,6 +47,13 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=1024, help="Max new tokens to generate")
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16"], help="Model dtype")
     p.add_argument("--cache_dir", type=str, default=None, help="Override Hugging Face cache dir (default: use HF_HOME / SCRATCH)")
+    p.add_argument(
+        "--model-family",
+        type=str,
+        default=None,
+        choices=["qwen3_vl", "llava", "tinyllava", "mllama"],
+        help="Force VLM backend (optional). If omitted, family is inferred from the model id / config.",
+    )
     return p.parse_args()
 
 
@@ -66,7 +73,7 @@ def main():
     cache_dir = os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(hf_home, "hub"))
     print(f"Model cache dir: {cache_dir}")
     print(f"Loading model {args.model}...")
-    loaded = load_vlm(args.model, dtype=dtype)
+    loaded = load_vlm(args.model, dtype=dtype, model_family=args.model_family)
 
     messages = build_messages(image_paths, args.prompt)
     response = run_vl_inference(loaded, messages, max_new_tokens=args.max_new_tokens)
