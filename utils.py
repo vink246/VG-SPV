@@ -5,8 +5,43 @@ Model-agnostic: supports Qwen3-VL, LLaVA, and other VL families via a registry.
 
 from typing import Any
 
+import types
+
 import torch
 from transformers import AutoProcessor
+
+
+def _ensure_pretrained_tie_weights_compat_patch() -> None:
+    """
+    Newer transformers calls tie_weights(recompute_mapping=False) from init_weights.
+    TinyLLaVA remote code defines tie_weights(self) without that kwarg — patch once per process.
+    """
+    import transformers.modeling_utils as modeling_utils
+
+    if getattr(modeling_utils.PreTrainedModel, "_vg_spv_tie_weights_compat", False):
+        return
+
+    _orig_init_weights = modeling_utils.PreTrainedModel.init_weights
+
+    def init_weights(self):
+        orig_tw = self.tie_weights
+
+        # MethodType passes the model as the first positional arg; orig_tw is already bound — use kwargs only.
+        def wrapped(*args, **kwargs):
+            kwargs.pop("recompute_mapping", None)
+            try:
+                return orig_tw(**kwargs)
+            except TypeError:
+                return orig_tw()
+
+        self.tie_weights = types.MethodType(wrapped, self)
+        try:
+            _orig_init_weights(self)
+        finally:
+            self.tie_weights = orig_tw
+
+    modeling_utils.PreTrainedModel.init_weights = init_weights
+    modeling_utils.PreTrainedModel._vg_spv_tie_weights_compat = True
 
 # Model family registry: maps family key to (model_class, processor_class) via lazy import.
 # Add new families here; get_model_family() infers family from model name.
@@ -48,6 +83,8 @@ def _load_tinyllava(
     See https://huggingface.co/tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    _ensure_pretrained_tie_weights_compat_patch()
 
     # attn_implementation="eager": TinyLLaVA's _supports_sdpa delegates to language_model, but
     # transformers checks SDPA during PreTrainedModel.__init__ before language_model is built — fixed in eager path.
