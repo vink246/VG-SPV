@@ -43,6 +43,45 @@ def _ensure_pretrained_tie_weights_compat_patch() -> None:
     modeling_utils.PreTrainedModel.init_weights = init_weights
     modeling_utils.PreTrainedModel._vg_spv_tie_weights_compat = True
 
+
+def _ensure_tinyllava_finalize_tie_weights_compat_patch() -> None:
+    """
+    After loading weights, transformers calls model.tie_weights(missing_keys=..., recompute_mapping=False).
+    TinyLLaVA remote tie_weights(self) accepts neither — wrap only for model_type tinyllava.
+    """
+    import transformers.modeling_utils as modeling_utils
+
+    if getattr(modeling_utils.PreTrainedModel, "_vg_spv_finalize_tie_compat", False):
+        return
+
+    _orig_finalize = modeling_utils.PreTrainedModel._finalize_model_loading
+
+    @classmethod
+    def _finalize_model_loading(cls, model, load_config, loading_info):
+        is_tinyllava = getattr(model.config, "model_type", None) == "tinyllava" or type(model).__name__ == "TinyLlavaForConditionalGeneration"
+        if not is_tinyllava:
+            return _orig_finalize(cls, model, load_config, loading_info)
+
+        orig_tw = model.tie_weights
+
+        def compat_tw(*args, **kwargs):
+            kwargs.pop("recompute_mapping", None)
+            kwargs.pop("missing_keys", None)
+            try:
+                return orig_tw(**kwargs)
+            except TypeError:
+                return orig_tw()
+
+        model.tie_weights = types.MethodType(compat_tw, model)
+        try:
+            return _orig_finalize(cls, model, load_config, loading_info)
+        finally:
+            model.tie_weights = orig_tw
+
+    modeling_utils.PreTrainedModel._finalize_model_loading = _finalize_model_loading
+    modeling_utils.PreTrainedModel._vg_spv_finalize_tie_compat = True
+
+
 # Model family registry: maps family key to (model_class, processor_class) via lazy import.
 # Add new families here; get_model_family() infers family from model name.
 def _get_qwen3_vl_classes() -> tuple[type, type]:
@@ -85,6 +124,7 @@ def _load_tinyllava(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     _ensure_pretrained_tie_weights_compat_patch()
+    _ensure_tinyllava_finalize_tie_weights_compat_patch()
 
     # attn_implementation="eager": TinyLLaVA's _supports_sdpa delegates to language_model, but
     # transformers checks SDPA during PreTrainedModel.__init__ before language_model is built — fixed in eager path.
