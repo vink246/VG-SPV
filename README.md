@@ -155,6 +155,7 @@ installed package based on the checkpoint filename (e.g. `groundingdino_swint_og
 
 ### 6. (Optional) API keys and data
 
+- To acquire and set up Hades and MM-SafetyBench datasets, from the root directory of the repo, run `./scripts/install_datasets.sh`. Resulting data can be found in the `data` folder.
 - For `data/generate_traces.py`: set your **OpenAI API key** (GPT-4o) if synthesizing traces.  
 - Download or configure paths for datasets under `data/` as required by the scripts (e.g. **HADES**, **MM Safety Bench**, **COCO**, **VLGuard**, **VisCRA**).
 
