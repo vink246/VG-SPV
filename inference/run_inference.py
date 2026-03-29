@@ -44,7 +44,7 @@ def parse_args():
     p.add_argument("--image", type=str, required=True, help="Path to input image (or comma-separated paths)")
     p.add_argument("--prompt", type=str, default="Describe this image.", help="Text prompt for the model")
     p.add_argument("--output", type=str, default=None, help="Optional path to save response text")
-    p.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens to generate")
+    p.add_argument("--max-new-tokens", type=int, default=1024, help="Max new tokens to generate")
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16"], help="Model dtype")
     p.add_argument("--cache_dir", type=str, default=None, help="Override Hugging Face cache dir (default: use HF_HOME / SCRATCH)")
     return p.parse_args()
