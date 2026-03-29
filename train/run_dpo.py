@@ -1,5 +1,5 @@
 """
-Launch DPO training with any supported VL model (Qwen3-VL, LLaVA, etc.) using VGSPVTrainer.
+Launch DPO training with any supported VL model (TinyLLaVA, LLaVA, etc.) using VGSPVTrainer.
 
 Uses TRL DPOTrainer pipeline; loss is overridable in train/dpo_trainer.py (VG-fDPO).
 """
@@ -23,8 +23,13 @@ from utils import load_vl_model_and_processor
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Run DPO training with Qwen3-VL-2B (VG-SPV).")
-    p.add_argument("--model_name", type=str, default="Qwen/Qwen3-VL-2B-Instruct", help="Model name or path (e.g. Qwen/Qwen3-VL-4B-Instruct, llava-hf/llava-1.5-7b-hf)")
+    p = argparse.ArgumentParser(description="Run DPO training with TinyLLaVA (VG-SPV).")
+    p.add_argument(
+        "--model_name",
+        type=str,
+        default="tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B",
+        help="Model name or path (e.g. tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B, llava-hf/llava-1.5-7b-hf)",
+    )
     p.add_argument("--data_path", type=str, default=None, help="Path to DPO dataset: CSV (image, perturbed_image, chosen_reasoning_trace, rejected_reasoning_trace) or dataset dir/HF name. Default: minimal example.")
     p.add_argument("--output_dir", type=str, default="outputs/dpo", help="Training output directory")
     p.add_argument("--num_train_epochs", type=int, default=1)
