@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
+
+import torch
 
 from vlm.registry import get_model_family
 from vlm.schema import LoadedVLM
@@ -83,20 +86,78 @@ def _run_tinyllava_chat(
     max_new_tokens: int,
     do_sample: bool,
 ) -> str:
+    """
+    TinyLLaVA hub ``chat()`` calls ``generate`` without ``attention_mask`` and always passes
+    ``temperature``, which triggers warnings when pad==eos and when do_sample is False.
+    We mirror hub prompt/image prep and call ``generate`` with an explicit mask and
+    only pass ``temperature`` when sampling.
+    """
     image_path, prompt_text = _extract_image_and_text_from_messages(messages)
     if not image_path:
         raise ValueError("TinyLLaVA inference requires an image in messages")
-    temperature = 0.7 if do_sample else 0.0
-    out = model.chat(
-        prompt=prompt_text,
-        tokenizer=tokenizer,
-        image=image_path,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-    )
-    if isinstance(out, tuple):
-        return out[0]
-    return out
+
+    mod_name = getattr(type(model), "__module__", "")
+    mod = sys.modules.get(mod_name)
+    if mod is None or not all(
+        hasattr(mod, name)
+        for name in (
+            "conv_phi_v0",
+            "tokenizer_image_token",
+            "load_image",
+            "process_images",
+            "DEFAULT_IMAGE_TOKEN",
+            "IMAGE_TOKEN_INDEX",
+        )
+    ):
+        out = model.chat(
+            prompt=prompt_text,
+            tokenizer=tokenizer,
+            image=image_path,
+            max_new_tokens=max_new_tokens,
+            temperature=0.7 if do_sample else 0.0,
+        )
+        if isinstance(out, tuple):
+            return out[0]
+        return out
+
+    conv_phi_v0 = mod.conv_phi_v0
+    tokenizer_image_token = mod.tokenizer_image_token
+    load_image = mod.load_image
+    process_images = mod.process_images
+    default_image_tok = mod.DEFAULT_IMAGE_TOKEN
+    image_token_index = mod.IMAGE_TOKEN_INDEX
+
+    image_processor = model.vision_tower._image_processor
+    prompt = default_image_tok + "\n" + prompt_text
+    conv = conv_phi_v0.copy()
+    conv.append_message(conv.roles[0], prompt)
+    conv.append_message(conv.roles[1], None)
+    prompt_full = conv.get_prompt()
+    pil = load_image(image_path)
+    image_tensor = process_images(pil, image_processor, model.config).to(model.device)
+
+    input_ids = tokenizer_image_token(
+        prompt_full, tokenizer, image_token_index, return_tensors="pt"
+    ).unsqueeze(0).to(model.device)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+    gen_kwargs: dict[str, Any] = {
+        "images": image_tensor,
+        "attention_mask": attention_mask,
+        "do_sample": do_sample,
+        "pad_token_id": tokenizer.pad_token_id,
+        "max_new_tokens": max_new_tokens,
+        "use_cache": True,
+        "num_beams": 1,
+    }
+    if do_sample:
+        gen_kwargs["temperature"] = 0.7
+
+    with torch.inference_mode():
+        output_ids = model.generate(input_ids, **gen_kwargs)
+
+    text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+    return text.strip()
 
 
 def run_vl_inference(
