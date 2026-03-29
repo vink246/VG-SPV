@@ -168,6 +168,40 @@ def resolve_config_from_checkpoint(checkpoint_path: str) -> str:
     return str(default)
 
 
+def _patch_bert_get_head_mask_for_grounding_dino() -> None:
+    """
+    GroundingDINO's bertwarper does ``self.get_head_mask = bert_model.get_head_mask``.
+    Newer ``transformers`` removed ``get_head_mask`` from ``BertModel`` / ``PreTrainedModel``,
+    which raises AttributeError at model construction. Patch it before loading GroundingDINO.
+    """
+    from transformers.models.bert.modeling_bert import BertModel
+
+    if hasattr(BertModel, "get_head_mask"):
+        return
+
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+    except ImportError:
+        PreTrainedModel = None  # type: ignore
+
+    if PreTrainedModel is not None and hasattr(PreTrainedModel, "get_head_mask"):
+        BertModel.get_head_mask = PreTrainedModel.get_head_mask
+        return
+
+    def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+        if head_mask is not None:
+            convert = getattr(self, "_convert_head_mask_to_5d", None)
+            if callable(convert):
+                head_mask = convert(head_mask, num_hidden_layers)
+            if is_attention_chunked:
+                head_mask = head_mask.unsqueeze(-1)
+        else:
+            head_mask = [None] * num_hidden_layers
+        return head_mask
+
+    BertModel.get_head_mask = get_head_mask
+
+
 def load_grounding_dino_model(
     config_path: str,
     checkpoint_path: str,
@@ -177,6 +211,7 @@ def load_grounding_dino_model(
     Load GroundingDINO model using the official groundingdino API.
     Requires `groundingdino` to be installed.
     """
+    _patch_bert_get_head_mask_for_grounding_dino()
     try:
         from groundingdino.util.inference import Model
     except ImportError as exc:
