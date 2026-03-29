@@ -19,7 +19,7 @@ from trl import DPOConfig
 
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION, load_dpo_dataset
 from train.dpo_trainer import VGSPVTrainer
-from utils import load_vl_model_and_processor
+from vlm import load_vlm
 
 
 def parse_args():
@@ -53,16 +53,18 @@ def main():
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     dtype = torch.bfloat16 if args.bf16 else torch.float32
-    model, processor = load_vl_model_and_processor(args.model_name, dtype=dtype)
-    tokenizer = getattr(processor, "tokenizer", processor)
+    loaded = load_vlm(args.model_name, dtype=dtype)
+    model = loaded.model
+    tokenizer = loaded.tokenizer
 
     ref_model = None
     if args.ref_8bit:
-        ref_model, _ = load_vl_model_and_processor(
+        ref_loaded = load_vlm(
             args.model_name,
             dtype=dtype,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
         )
+        ref_model = ref_loaded.model
     # If ref_model is None, DPOTrainer creates a copy of the model as ref
 
     train_dataset = load_dpo_dataset(

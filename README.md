@@ -19,7 +19,8 @@ VG-SPV/
 ├── inference/                     # Scripts to query the model (no training)
 │   ├── run_inference.py           # VL image + text inference (use --model to choose model)
 │   ├── run_grounding_dino.py      # Grounding DINO inference for box supervision / GT generation
-│   └── utils.py                   # Inference-only helpers (e.g. run_vl_inference)
+│   └── utils.py                   # Legacy inference helpers (prefer `vlm.run_vl_inference` + `LoadedVLM`)
+├── vlm/                           # VLM backends (Qwen-VL, LLaVA, TinyLLaVA): load_vlm, run_vl_inference, LoadedVLM
 ├── models/                        # VG-PRM reward logic and TinyLLaVA model wrappers
 │   └── reward_dino.py             # Grounding DINO IoU-based reward computation
 ├── scripts/                       # Bash scripts for launching training/eval runs
@@ -30,7 +31,7 @@ VG-SPV/
 │   ├── dpo_trainer.py             # VGSPVTrainer (override compute_loss for VG-fDPO)
 │   ├── dataset_adapter.py         # DPO dataset contract and CSV loader (image, perturbed_image, chosen/rejected reasoning traces)
 │   └── run_dpo.py                 # DPO training entrypoint
-├── utils.py                       # Shared, model-agnostic helpers (VL registry, load_vl_model_and_processor, build_messages, parse_dtype)
+├── utils.py                       # Re-exports vlm + build_messages (chat JSON format)
 ├── environment.yml                # Dependencies (torch, transformers, groundingdino, etc.)
 ├── README.md                      # This file
 └── LICENSE                        # Apache 2.0
@@ -94,7 +95,7 @@ The `environment.yml` includes:
 
 - **Python 3.10**, PyTorch (CUDA 12.1), torchvision, torchaudio  
 - **Transformers**, Accelerate, PEFT, TRL, Datasets  
-- **VL models**: Inference and training are model-agnostic. Supported families include **Qwen3-VL** (e.g. 2B, 4B, 8B) and **LLaVA**; add more in `utils.py` via the VL family registry.  
+- **VL models**: Inference and training are model-agnostic. Supported families include **Qwen3-VL** (e.g. 2B, 4B, 8B), **LLaVA**, and **TinyLLaVA**; add more in [`vlm/backends/`](vlm/backends/) and [`vlm/registry.py`](vlm/registry.py) (pattern → family → backend).  
 - **Grounding DINO** (from source) for spatial reward computation — install after env create: `bash scripts/install_grounding_dino.sh`.  
 - **Flash Attention** (optional, for Qwen-VL memory efficiency) — install after env create: `bash scripts/install_flash_attn.sh`.  
 
