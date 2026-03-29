@@ -269,6 +269,73 @@ def load_grounding_dino_model(
     return model
 
 
+def _scores_to_logit_approx(scores: np.ndarray) -> np.ndarray:
+    """Map confidence in (0, 1) to a logit for JSON export (inverse sigmoid)."""
+    s = np.clip(scores.astype(np.float64), 1e-6, 1.0 - 1e-6)
+    return np.log(s / (1.0 - s)).astype(np.float32)
+
+
+def _from_supervision_detections(
+    detections: Any,
+    phrases: List[str],
+) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
+    """
+    New groundingdino API: predict_with_caption returns (sv.Detections, list of label strings).
+    """
+    xyxy = np.asarray(getattr(detections, "xyxy", np.empty((0, 4))), dtype=np.float32)
+    n = xyxy.shape[0]
+    if n == 0:
+        return xyxy, np.array([], dtype=np.float32), [], np.array([], dtype=np.float32)
+
+    conf = getattr(detections, "confidence", None)
+    if conf is None:
+        scores = np.ones((n,), dtype=np.float32)
+    else:
+        scores = np.asarray(conf, dtype=np.float32).reshape(-1)
+        if scores.shape[0] != n:
+            if scores.shape[0] > n:
+                scores = scores[:n]
+            else:
+                scores = np.pad(scores, (0, n - scores.shape[0]), constant_values=1.0)
+
+    labels = [str(p) for p in phrases]
+    if len(labels) < n:
+        labels.extend([""] * (n - len(labels)))
+    elif len(labels) > n:
+        labels = labels[:n]
+
+    logits = _scores_to_logit_approx(scores)
+    return xyxy, scores, labels, logits
+
+
+def _from_legacy_boxes_logits_phrases(
+    boxes: Any,
+    logits: Any,
+    phrases: Any,
+    h: int,
+    w: int,
+) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
+    """Older API: boxes (nq, 4) cxcywh normalized, raw per-token logits tensor, phrases list."""
+    boxes_t = np.asarray(boxes, dtype=np.float32)
+    boxes_abs = box_convert(
+        torch.from_numpy(boxes_t),
+        in_fmt="cxcywh",
+        out_fmt="xyxy",
+    )
+    boxes_abs[:, [0, 2]] *= w
+    boxes_abs[:, [1, 3]] *= h
+    boxes_abs_np = boxes_abs.numpy()
+
+    logits_np = np.asarray(logits, dtype=np.float32)
+    if logits_np.ndim == 2:
+        logits_np = logits_np.max(axis=1)
+    else:
+        logits_np = logits_np.reshape(-1)
+    scores = 1.0 / (1.0 + np.exp(-logits_np))
+    labels = [str(p) for p in phrases]
+    return boxes_abs_np, scores, labels, logits_np
+
+
 def run_grounding_dino(
     model: Any,
     image_path: str,
@@ -287,52 +354,42 @@ def run_grounding_dino(
     """
     pil_image = Image.open(image_path).convert("RGB")
     image_array = np.asarray(pil_image)
-
-    # The groundingdino Model wrapper exposes a predict method with this signature:
-    #   predict_with_caption(
-    #       image: np.ndarray,
-    #       caption: str,
-    #       box_threshold: float,
-    #       text_threshold: float,
-    #   )
-    #
-    # Some versions expose `predict` instead; we handle both.
-    if hasattr(model, "predict_with_caption"):
-        boxes, logits, phrases = model.predict_with_caption(
-            image=image_array,
-            caption=text_prompt,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-        )
-    elif hasattr(model, "predict"):
-        boxes, logits, phrases = model.predict(
-            image=image_array,
-            caption=text_prompt,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-        )
-    else:
-        raise AttributeError(
-            "GroundingDINO model does not expose `predict_with_caption` or `predict`."
-        )
-
-    # boxes are typically in cxcywh normalized format in [0, 1]; convert to XYXY absolute.
-    boxes = np.asarray(boxes, dtype=np.float32)
     h, w = image_array.shape[:2]
-    boxes_abs = box_convert(
-        torch.from_numpy(boxes),
-        in_fmt="cxcywh",
-        out_fmt="xyxy",
+
+    # groundingdino.util.inference.Model:
+    # - New API: predict_with_caption -> (sv.Detections, phrases)
+    # - Old API: (boxes, logits, phrases) torch tensors
+    if hasattr(model, "predict_with_caption"):
+        raw = model.predict_with_caption(
+            image=image_array,
+            caption=text_prompt,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+        )
+        if isinstance(raw, tuple) and len(raw) == 2:
+            return _from_supervision_detections(raw[0], list(raw[1]))
+        if isinstance(raw, tuple) and len(raw) == 3:
+            return _from_legacy_boxes_logits_phrases(raw[0], raw[1], raw[2], h, w)
+        raise ValueError(
+            f"Unexpected predict_with_caption return length: {len(raw) if isinstance(raw, tuple) else type(raw)}"
+        )
+    if hasattr(model, "predict"):
+        raw = model.predict(
+            image=image_array,
+            caption=text_prompt,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+        )
+        if isinstance(raw, tuple) and len(raw) == 2:
+            return _from_supervision_detections(raw[0], list(raw[1]))
+        if isinstance(raw, tuple) and len(raw) == 3:
+            return _from_legacy_boxes_logits_phrases(raw[0], raw[1], raw[2], h, w)
+        raise ValueError(
+            f"Unexpected predict return length: {len(raw) if isinstance(raw, tuple) else type(raw)}"
+        )
+    raise AttributeError(
+        "GroundingDINO model does not expose `predict_with_caption` or `predict`."
     )
-    boxes_abs[:, [0, 2]] *= w
-    boxes_abs[:, [1, 3]] *= h
-    boxes_abs = boxes_abs.numpy()
-
-    logits = np.asarray(logits, dtype=np.float32).reshape(-1)
-    scores = 1.0 / (1.0 + np.exp(-logits))
-    labels = [str(p) for p in phrases]
-
-    return boxes_abs, scores, labels, logits
 
 
 def to_serializable(
@@ -341,15 +398,17 @@ def to_serializable(
     labels: List[str],
     logits: np.ndarray,
 ) -> List[Dict[str, Any]]:
+    n = int(boxes_xyxy.shape[0])
     detections: List[Dict[str, Any]] = []
-    for i in range(len(labels)):
+    for i in range(n):
         x1, y1, x2, y2 = boxes_xyxy[i].tolist()
+        lab = labels[i] if i < len(labels) else ""
         detections.append(
             {
                 "box_xyxy": [float(x1), float(y1), float(x2), float(y2)],
-                "score": float(scores[i]),
-                "logit": float(logits[i]),
-                "label": labels[i],
+                "score": float(scores[i]) if i < len(scores) else 0.0,
+                "logit": float(logits[i]) if i < len(logits) else 0.0,
+                "label": lab,
             }
         )
     return detections
@@ -365,10 +424,11 @@ def draw_boxes(
     if image_bgr is None:
         raise FileNotFoundError(f"Could not read image with OpenCV: {image_path}")
 
-    for i in range(len(labels)):
+    n = int(boxes_xyxy.shape[0])
+    for i in range(n):
         x1, y1, x2, y2 = boxes_xyxy[i].astype(int)
         score = float(scores[i])
-        label = labels[i]
+        label = labels[i] if i < len(labels) else ""
         color = (0, 255, 0)
         cv2.rectangle(image_bgr, (x1, y1), (x2, y2), color, 2)
         text = f"{label}: {score:.2f}"
@@ -420,11 +480,13 @@ def main() -> None:
         text_threshold=args.text_threshold,
     )
 
-    if len(labels) == 0:
+    n_boxes = int(boxes_xyxy.shape[0])
+    if n_boxes == 0:
         print("No detections above thresholds.")
     else:
-        print(f"Detected {len(labels)} boxes:")
-        for i, label in enumerate(labels):
+        print(f"Detected {n_boxes} boxes:")
+        for i in range(n_boxes):
+            label = labels[i] if i < len(labels) else ""
             x1, y1, x2, y2 = boxes_xyxy[i]
             print(
                 f"  {i}: {label} | score={scores[i]:.3f} | box=[{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]"
@@ -439,7 +501,7 @@ def main() -> None:
         print(f"Saved detections JSON to {out_json}")
 
     if args.output_viz:
-        if len(labels) == 0:
+        if len(boxes_xyxy) == 0:
             print("Skipping visualization because there are no detections.")
         else:
             viz = draw_boxes(args.image, boxes_xyxy, scores, labels)
