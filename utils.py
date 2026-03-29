@@ -49,10 +49,13 @@ def _load_tinyllava(
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    # attn_implementation="eager": TinyLLaVA's _supports_sdpa delegates to language_model, but
+    # transformers checks SDPA during PreTrainedModel.__init__ before language_model is built — fixed in eager path.
     kwargs: dict[str, Any] = {
         "trust_remote_code": True,
-        "torch_dtype": dtype,
+        "dtype": dtype,
         "device_map": device_map,
+        "attn_implementation": "eager",
     }
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
