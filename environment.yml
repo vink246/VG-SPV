@@ -3,7 +3,7 @@ channels:
   - pytorch
   - nvidia
   - conda-forge
-  - defaults
+  - nodefaults
 dependencies:
   # Core Python & Build tools
   - python=3.10
@@ -25,6 +25,7 @@ dependencies:
       - trl
       - datasets
       - qwen-vl-utils
+      - gdown
       # Install after env create with --no-build-isolation (see scripts/):
       # - scripts/install_grounding_dino.sh  (Grounding DINO)
       # - scripts/install_flash_attn.sh      (optional, flash-attn)
