@@ -26,12 +26,45 @@ VL_FAMILY_REGISTRY: dict[str, Any] = {
 }
 
 # Substrings in model name (lowercase) that select a family. First match wins.
+# "tinyllava" must come before "llava" so tinyllava/* repos are not treated as HF LLaVA.
 VL_FAMILY_PATTERNS: list[tuple[str, str]] = [
     ("qwen3-vl", "qwen3_vl"),
     ("qwen2-vl", "qwen3_vl"),  # Qwen2-VL uses same/similar API
     ("qwen", "qwen3_vl"),      # fallback for Qwen VL
+    ("tinyllava", "tinyllava"),
     ("llava", "llava"),
 ]
+
+
+def _load_tinyllava(
+    model_name: str,
+    dtype: torch.dtype,
+    device_map: str,
+    quantization_config: Any,
+) -> tuple[Any, Any]:
+    """
+    TinyLLaVA Factory models (e.g. tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B) use custom code:
+    AutoModelForCausalLM + trust_remote_code, and AutoTokenizer with config-driven settings.
+    See https://huggingface.co/tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "torch_dtype": dtype,
+        "device_map": device_map,
+    }
+    if quantization_config is not None:
+        kwargs["quantization_config"] = quantization_config
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    config = model.config
+    tok_kwargs: dict[str, Any] = {"use_fast": False, "trust_remote_code": True}
+    if hasattr(config, "tokenizer_model_max_length"):
+        tok_kwargs["model_max_length"] = config.tokenizer_model_max_length
+    if hasattr(config, "tokenizer_padding_side"):
+        tok_kwargs["padding_side"] = config.tokenizer_padding_side
+    tokenizer = AutoTokenizer.from_pretrained(model_name, **tok_kwargs)
+    return model, tokenizer
 
 
 def get_model_family(model_name: str) -> str:
@@ -42,8 +75,7 @@ def get_model_family(model_name: str) -> str:
     name_lower = model_name.lower()
     for pattern, family in VL_FAMILY_PATTERNS:
         if pattern in name_lower:
-            if family in VL_FAMILY_REGISTRY:
-                return family
+            return family
     return "qwen3_vl"  # default to Qwen3-VL for unknown names
 
 
@@ -76,14 +108,17 @@ def load_vl_model_and_processor(
 ) -> tuple[Any, Any]:
     """
     Load a vision-language model and its processor by name/path.
-    Model family is inferred from model_name if not provided (e.g. qwen3_vl, llava).
-    Returns (model, processor); processor has .tokenizer for training.
+    Model family is inferred from model_name if not provided (e.g. qwen3_vl, llava, tinyllava).
+    Returns (model, processor). For Qwen/LLaVA, processor is AutoProcessor (use .tokenizer for training).
+    For TinyLLaVA, the second value is the tokenizer itself (no nested .tokenizer).
     """
     if isinstance(dtype, str):
         dtype = parse_dtype(dtype)
     family = model_family if model_family is not None else get_model_family(model_name)
+    if family == "tinyllava":
+        return _load_tinyllava(model_name, dtype, device_map, quantization_config)
     if family not in VL_FAMILY_REGISTRY:
-        raise ValueError(f"Unknown VL family: {family}. Known: {list(VL_FAMILY_REGISTRY.keys())}")
+        raise ValueError(f"Unknown VL family: {family}. Known: {list(VL_FAMILY_REGISTRY.keys())} plus tinyllava")
     model_cls, processor_cls = VL_FAMILY_REGISTRY[family]()
     kwargs = {"torch_dtype": dtype, "device_map": device_map}
     if quantization_config is not None:

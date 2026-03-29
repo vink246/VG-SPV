@@ -54,7 +54,7 @@ def main():
 
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     model, processor = load_vl_model_and_processor(args.model_name, dtype=dtype)
-    tokenizer = processor.tokenizer
+    tokenizer = getattr(processor, "tokenizer", processor)
 
     ref_model = None
     if args.ref_8bit:

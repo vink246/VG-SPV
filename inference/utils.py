@@ -74,6 +74,49 @@ _PREPARE_INPUTS: dict[str, Any] = {
 }
 
 
+def _extract_image_and_text_from_messages(messages: list[dict[str, Any]]) -> tuple[str | None, str]:
+    """First user message: collect image path/URL and text prompt."""
+    content = messages[0]["content"] if messages else []
+    image_path: str | None = None
+    prompt_text = ""
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "image":
+            image_path = item.get("image")
+        elif item.get("type") == "text":
+            prompt_text = item.get("text", "")
+    return image_path, prompt_text
+
+
+def _run_tinyllava_inference(
+    model: Any,
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    max_new_tokens: int,
+    do_sample: bool,
+) -> str:
+    """
+    TinyLLaVA Factory models expose model.chat(prompt=..., image=..., tokenizer=...).
+    Processor here is the tokenizer returned by load_vl_model_and_processor.
+    """
+    image_path, prompt_text = _extract_image_and_text_from_messages(messages)
+    if not image_path:
+        raise ValueError("TinyLLaVA inference requires an image in messages")
+    # TinyLLaVA chat() uses temperature>0 for sampling, not do_sample (see modeling_tinyllava_phi.chat)
+    temperature = 0.7 if do_sample else 0.0
+    out = model.chat(
+        prompt=prompt_text,
+        tokenizer=tokenizer,
+        image=image_path,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+    if isinstance(out, tuple):
+        return out[0]
+    return out
+
+
 def run_vl_inference(
     model: Any,
     processor: Any,
@@ -92,8 +135,12 @@ def run_vl_inference(
         family = get_model_family(model_name)
     if family is None:
         family = "qwen3_vl"
+    if family == "tinyllava":
+        return _run_tinyllava_inference(
+            model, processor, messages, max_new_tokens, do_sample
+        )
     if family not in _PREPARE_INPUTS:
-        raise ValueError(f"No inference path for VL family: {family}. Supported: {list(_PREPARE_INPUTS.keys())}")
+        raise ValueError(f"No inference path for VL family: {family}. Supported: {list(_PREPARE_INPUTS.keys())} plus tinyllava")
     prepare_fn = _PREPARE_INPUTS[family]
     inputs = prepare_fn(model, processor, messages)
     generated_ids = model.generate(
