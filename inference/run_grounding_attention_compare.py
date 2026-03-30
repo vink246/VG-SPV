@@ -339,13 +339,8 @@ def save_attention_heatmap_overlay(
     out_path: Path,
     *,
     alpha: float = 0.45,
-    percentile_clip: float = 90.0,
-    gamma: float = 0.55,
 ) -> None:
-    """
-    Upsample heat2d to image size, soften contrast (clip high percentiles, gamma), JET, blend, write PNG.
-    gamma < 1 lifts mid-level mass so the map is easier to read than min-max alone.
-    """
+    """Upsample heat2d to image size, min–max normalize, JET colormap, blend over BGR, write PNG."""
     import cv2
 
     bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
@@ -353,16 +348,12 @@ def save_attention_heatmap_overlay(
         raise FileNotFoundError(f"Could not read image: {image_path}")
     h, w = bgr.shape[:2]
     hm = cv2.resize(heat2d.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
-    hm = np.clip(hm, 0.0, None)
-    pc = float(np.clip(percentile_clip, 50.0, 100.0))
-    hi = float(np.percentile(hm, pc))
-    if hi > hm.min():
-        hm = np.minimum(hm, hi)
-    hm = hm - hm.min()
-    denom = float(hm.max()) if hm.max() > 0 else 1.0
-    hm = hm / denom
-    g = float(np.clip(gamma, 0.15, 1.0))
-    hm = np.power(hm, g)
+    hm_min = float(hm.min())
+    hm_max = float(hm.max())
+    if hm_max > hm_min:
+        hm = (hm - hm_min) / (hm_max - hm_min)
+    else:
+        hm = np.zeros_like(hm, dtype=np.float32)
     hm_u8 = (np.clip(hm, 0.0, 1.0) * 255.0).astype(np.uint8)
     colored = cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET)
     blended = (alpha * colored.astype(np.float32) + (1.0 - alpha) * bgr.astype(np.float32)).astype(
@@ -760,18 +751,6 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="multiscale: score = sum / area**p (0=raw sum favors large, 1=mean favors compact peaks)",
     )
-    p.add_argument(
-        "--heatmap-percentile-clip",
-        type=float,
-        default=90.0,
-        help="Saved heatmap: clip intensities at this percentile before stretching colormap (softer peaks)",
-    )
-    p.add_argument(
-        "--heatmap-gamma",
-        type=float,
-        default=0.55,
-        help="Saved heatmap: apply gamma after clip (<1 brightens mid-level mass for readability)",
-    )
     p.add_argument("--sample", action="store_true", help="Use sampling for generation")
     p.add_argument("--dino-checkpoint", type=str, default=None, help="Grounding DINO .pth (optional)")
     p.add_argument("--dino-config", type=str, default=None, help="Override DINO config .py path")
@@ -915,13 +894,7 @@ def main() -> None:
         if args.output_heatmap
         else out_path.with_name(f"{out_path.stem}_attention_heatmap.png")
     )
-    save_attention_heatmap_overlay(
-        str(img_path),
-        attn_heat2d,
-        heatmap_path,
-        percentile_clip=args.heatmap_percentile_clip,
-        gamma=args.heatmap_gamma,
-    )
+    save_attention_heatmap_overlay(str(img_path), attn_heat2d, heatmap_path)
     print(f"Saved attention heatmap to {heatmap_path}")
 
 
