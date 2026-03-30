@@ -139,9 +139,11 @@ def sliding_window_argmax_box(
     stride: int,
     img_h: int,
     img_w: int,
+    top_k: int = 3,
+    rng: np.random.Generator | None = None,
 ) -> tuple[float, float, float, float]:
     """
-    Score = sum of heat in each BxB window (VisCRA-style patch aggregation); pick the single best window.
+    VisCRA-style: score = sum of heat in each BxB window; pick uniformly among the top-k windows.
     Returns xyxy in pixel coordinates relative to full image.
     """
     h, w = heat2d.shape
@@ -156,7 +158,11 @@ def sliding_window_argmax_box(
     best_scores.sort(key=lambda t: t[0], reverse=True)
     if not best_scores:
         return 0.0, 0.0, float(img_w), float(img_h)
-    _, y0, x0 = best_scores[0]
+    k = min(max(1, top_k), len(best_scores))
+    pick = 0
+    if rng is not None and k > 1:
+        pick = int(rng.integers(0, k))
+    _, y0, x0 = best_scores[pick]
     # Map patch grid coords to image pixels
     px1 = x0 / max(w, 1) * img_w
     py1 = y0 / max(h, 1) * img_h
@@ -337,6 +343,8 @@ def run_mllama_with_grounding_attention(
     do_sample: bool,
     window: int,
     stride: int,
+    top_k_patches: int = 3,
+    seed: int = 0,
     box_strategy: str = "viscra",
     cc_percentile: float = 75.0,
     cc_blur_sigma: float = 0.0,
@@ -458,11 +466,19 @@ def run_mllama_with_grounding_attention(
         heat2d = heat2d / heat2d.max()
 
     ms_sizes = multiscale_windows if multiscale_windows is not None else [4, 6, 8, 12, 16, 20, 24]
+    rng = np.random.default_rng(seed)
 
     if box_strategy == "viscra":
-        x1, y1, x2, y2 = sliding_window_argmax_box(heat2d, window, stride, img_h, img_w)
+        x1, y1, x2, y2 = sliding_window_argmax_box(
+            heat2d, window, stride, img_h, img_w, top_k=top_k_patches, rng=rng
+        )
         box = np.array([x1, y1, x2, y2], dtype=np.float32)
-        box_meta: dict[str, Any] = {"box_strategy": "viscra", "window": window, "stride": stride}
+        box_meta: dict[str, Any] = {
+            "box_strategy": "viscra",
+            "window": window,
+            "stride": stride,
+            "viscra_top_k": top_k_patches,
+        }
     elif box_strategy == "connected":
         x1, y1, x2, y2 = connected_component_box(
             heat2d,
@@ -601,6 +617,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--window", type=int, default=12, help="Sliding window size on heatmap grid (VisCRA default 12)")
     p.add_argument("--stride", type=int, default=4, help="Sliding window stride (VisCRA default 4)")
     p.add_argument(
+        "--top-k-patches",
+        type=int,
+        default=3,
+        help="viscra: uniformly sample among the top-k windows by heat sum (VisCRA uses 3); seed via --seed",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for viscra top-k sampling (only affects --box-strategy viscra)",
+    )
+    p.add_argument(
         "--attention-span",
         type=str,
         default="grounding",
@@ -612,7 +640,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="viscra",
         choices=["viscra", "connected", "multiscale"],
-        help="How to turn the attention heatmap into a box: viscra=fixed window+top-k; "
+        help="How to turn the attention heatmap into a box: viscra=fixed window, random among top-k sums; "
         "connected=largest component above percentile; multiscale=best square among several sizes",
     )
     p.add_argument(
@@ -703,6 +731,8 @@ def main() -> None:
         do_sample=args.sample,
         window=args.window,
         stride=args.stride,
+        top_k_patches=args.top_k_patches,
+        seed=args.seed,
         box_strategy=args.box_strategy,
         cc_percentile=args.cc_percentile,
         cc_blur_sigma=args.cc_blur_sigma,
