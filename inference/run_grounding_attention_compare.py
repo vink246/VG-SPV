@@ -61,6 +61,26 @@ def box_iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
     return float(inter / union) if union > 0 else 0.0
 
 
+def heat_mass_in_pixel_box(
+    heat2d: np.ndarray,
+    box_xyxy: np.ndarray,
+    img_h: int,
+    img_w: int,
+) -> float:
+    """Sum of heatmap values over grid cells intersecting the pixel-aligned box (xyxy in image pixels)."""
+    gh, gw = heat2d.shape
+    x1, y1, x2, y2 = (float(box_xyxy[i]) for i in range(4))
+    gx1 = int(np.floor(x1 / max(img_w, 1) * gw))
+    gx2 = int(np.ceil(x2 / max(img_w, 1) * gw))
+    gy1 = int(np.floor(y1 / max(img_h, 1) * gh))
+    gy2 = int(np.ceil(y2 / max(img_h, 1) * gh))
+    gx1 = int(np.clip(gx1, 0, max(gw - 1, 0)))
+    gy1 = int(np.clip(gy1, 0, max(gh - 1, 0)))
+    gx2 = int(np.clip(max(gx2, gx1 + 1), 0, gw))
+    gy2 = int(np.clip(max(gy2, gy1 + 1), 0, gh))
+    return float(heat2d[gy1:gy2, gx1:gx2].sum())
+
+
 def best_factor_grid(n: int, img_h: int, img_w: int) -> tuple[int, int]:
     """Factors n into nh x nw with aspect ratio close to img_h:img_w."""
     if n <= 0:
@@ -409,6 +429,7 @@ def run_mllama_with_grounding_attention(
                 "image_hw": [img_h, img_w],
             }
             placeholder = np.zeros((1, 1), dtype=np.float32)
+            meta["mllm_attn_box_mass"] = 0.0
             return (
                 full_response,
                 np.array([0.0, 0.0, float(img_w), float(img_h)]),
@@ -476,6 +497,7 @@ def run_mllama_with_grounding_attention(
     else:
         raise ValueError(f"Unknown box_strategy: {box_strategy!r}")
 
+    mllm_mass = heat_mass_in_pixel_box(heat2d, box, img_h, img_w)
     meta = {
         "cross_attn_layer_index": idx,
         "num_cross_layers": len(cross_mods),
@@ -486,6 +508,7 @@ def run_mllama_with_grounding_attention(
         "vision_tokens": int(attn_mean.shape[0]),
         "heatmap_shape": list(heat2d.shape),
         "image_hw": [img_h, img_w],
+        "mllm_attn_box_mass": mllm_mass,
         **box_meta,
     }
     return full_response, box, meta, heat2d
@@ -496,6 +519,9 @@ def draw_overlay(
     mllm_box: np.ndarray | None,
     dino_box: np.ndarray | None,
     dino_label: str,
+    *,
+    mllm_score: float | None = None,
+    dino_score: float | None = None,
 ) -> np.ndarray:
     import cv2
 
@@ -505,12 +531,16 @@ def draw_overlay(
     if mllm_box is not None:
         x1, y1, x2, y2 = [int(round(v)) for v in mllm_box]
         cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        mllm_txt = "MLLM attn"
+        if mllm_score is not None:
+            mllm_txt = f"MLLM mass={mllm_score:.3f}"
+        ty = max(y1 - 8, 22)
         cv2.putText(
             bgr,
-            "MLLM attn",
-            (x1, max(y1 - 8, 20)),
+            mllm_txt,
+            (x1, ty),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.55,
             (0, 0, 255),
             2,
             cv2.LINE_AA,
@@ -518,10 +548,16 @@ def draw_overlay(
     if dino_box is not None:
         x1, y1, x2, y2 = [int(round(v)) for v in dino_box]
         cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        lab = (dino_label or "").strip()[:36]
+        if dino_score is not None:
+            dino_txt = f"DINO score={dino_score:.3f}" + (f" ({lab})" if lab else "")
+        else:
+            dino_txt = f"DINO {lab}" if lab else "DINO"
+        base_y = min(y2 + 20, bgr.shape[0] - 8)
         cv2.putText(
             bgr,
-            f"DINO {dino_label[:40]}",
-            (x1, min(y2 + 22, bgr.shape[0] - 4)),
+            dino_txt,
+            (x1, base_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             (0, 255, 0),
@@ -685,6 +721,7 @@ def main() -> None:
 
     dino_box: np.ndarray | None = None
     dino_label = ""
+    dino_score: float | None = None
     iou: float | None = None
 
     if not args.no_dino and args.dino_checkpoint:
@@ -720,9 +757,12 @@ def main() -> None:
             j = int(np.argmax(scores))
             dino_box = boxes_xyxy[j].astype(np.float32)
             dino_label = labels[j] if j < len(labels) else ""
+            dino_score = float(scores[j]) if j < len(scores) else None
             iou = box_iou_xyxy(mllm_box, dino_box)
             print("--- DINO best box (xyxy pixels) ---")
             print(dino_box.tolist())
+            if dino_score is not None:
+                print(f"--- DINO detection score ---\n{dino_score:.4f}")
             print(f"--- IoU (MLLM attn box vs best DINO box) ---\n{iou:.4f}")
     elif not args.no_dino:
         print("Skipping DINO: pass --dino-checkpoint or use --no-dino to silence this.")
@@ -731,7 +771,16 @@ def main() -> None:
 
     out_path = Path(args.output_viz)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    viz = draw_overlay(str(img_path), mllm_box, dino_box, dino_label)
+    mllm_s = meta.get("mllm_attn_box_mass")
+    mllm_s_f = float(mllm_s) if mllm_s is not None else None
+    viz = draw_overlay(
+        str(img_path),
+        mllm_box,
+        dino_box,
+        dino_label,
+        mllm_score=mllm_s_f,
+        dino_score=dino_score,
+    )
     cv2.imwrite(str(out_path), viz)
     print(f"Saved visualization to {out_path}")
 
