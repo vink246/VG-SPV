@@ -322,6 +322,7 @@ def run_mllama_with_grounding_attention(
     cc_blur_sigma: float = 0.0,
     multiscale_windows: list[int] | None = None,
     multiscale_area_power: float = 0.5,
+    attention_span: str = "grounding",
 ) -> tuple[str, np.ndarray, dict[str, Any], np.ndarray]:
     from PIL import Image
     from transformers import AutoProcessor, MllamaForConditionalGeneration
@@ -418,7 +419,13 @@ def run_mllama_with_grounding_attention(
         new_ids = new_ids[:m]
 
     g0, g1 = find_grounding_token_steps(new_ids, tok)
-    stack = torch.stack([c[0].mean(dim=0)[0] for c in captures[g0 : g1 + 1]], dim=0)
+    if attention_span == "grounding":
+        span_captures = captures[g0 : g1 + 1]
+    elif attention_span == "full":
+        span_captures = captures
+    else:
+        raise ValueError(f"attention_span must be 'grounding' or 'full', got {attention_span!r}")
+    stack = torch.stack([c[0].mean(dim=0)[0] for c in span_captures], dim=0)
     attn_mean = stack.mean(dim=0)
     if attn_mean.numel() == 0:
         attn_mean = torch.ones(1, device=stack.device)
@@ -472,7 +479,9 @@ def run_mllama_with_grounding_attention(
     meta = {
         "cross_attn_layer_index": idx,
         "num_cross_layers": len(cross_mods),
+        "attention_span": attention_span,
         "grounding_token_steps": [g0, g1],
+        "attention_steps_used": len(span_captures),
         "num_decode_steps_captured": len(captures),
         "vision_tokens": int(attn_mean.shape[0]),
         "heatmap_shape": list(heat2d.shape),
@@ -555,6 +564,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--window", type=int, default=12, help="Sliding window size on heatmap grid (VisCRA default 12)")
     p.add_argument("--stride", type=int, default=4, help="Sliding window stride (VisCRA default 4)")
+    p.add_argument(
+        "--attention-span",
+        type=str,
+        default="grounding",
+        choices=["grounding", "full"],
+        help="Average cross-attention over decode steps inside <grounding> only (grounding), or over the full generated sequence (full)",
+    )
     p.add_argument(
         "--box-strategy",
         type=str,
@@ -656,6 +672,7 @@ def main() -> None:
         cc_blur_sigma=args.cc_blur_sigma,
         multiscale_windows=multiscale_list,
         multiscale_area_power=args.multiscale_area_power,
+        attention_span=args.attention_span,
     )
 
     print("--- Model response ---")
