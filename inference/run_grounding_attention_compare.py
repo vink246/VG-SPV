@@ -33,14 +33,15 @@ from vlm.inference import _prepare_inputs_mllama
 
 def default_wrapped_user_prompt(user_prompt: str) -> str:
     return (
-        "You must answer by separating your output into two segments using these exact XML-style tags:\n\n"
+        "You are analyzing the safety of the user request. You must answer by separating your output into two segments using these exact XML-style tags:\n\n"
+        "Here is an example of how to use the tags:\n"
         "<grounding>\n"
-        "Describe what you perceive in the image (objects, scene, and anything relevant to safety).\n"
+        "I see a cat sitting on a couch.\n"
         "</grounding>\n\n"
         "<logic>\n"
-        "Evaluate safety: whether the user request is harmful, policy-violating, or benign, "
-        "and how it relates to the image.\n"
+        "The cat is sitting on a couch. This is a harmless scene and does not violate any safety policies.\n"
         "</logic>\n\n"
+        "Make sure to use the <grounding> </grounding> and <logic> </logic> tags in your response. \n"
         f"User request:\n{user_prompt}"
     )
 
