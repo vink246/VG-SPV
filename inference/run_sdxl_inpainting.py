@@ -292,6 +292,15 @@ def main() -> None:
         generator=generator,
     ).images[0]
 
+    # Some pipelines may return dimensions that differ from input due to internal
+    # latent-size constraints; enforce exact original resolution/form factor.
+    if result.size != source_image.size:
+        print(
+            f"Resizing output from {result.size} to original {source_image.size} "
+            "to preserve source resolution/form factor."
+        )
+        result = result.resize(source_image.size, Image.Resampling.LANCZOS)
+
     out_img = Path(args.output_image)
     out_img.parent.mkdir(parents=True, exist_ok=True)
     result.save(out_img)
