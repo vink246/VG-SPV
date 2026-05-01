@@ -39,6 +39,29 @@ def parse_args():
     p.add_argument("--max_length", type=int, default=512)
     p.add_argument("--max_prompt_length", type=int, default=256)
     p.add_argument("--beta", type=float, default=0.1, help="DPO temperature")
+    p.add_argument("--alpha_vdpo", type=float, default=0.1, help="Weight for V-DPO term in total loss")
+    p.add_argument("--vdpo_margin_m", type=float, default=0.0, help="Margin m for V-DPO hinge")
+    p.add_argument("--alpha_format", type=float, default=12.0, help="Scaling for format-fail fallback loss")
+    p.add_argument(
+        "--grounding_mode",
+        type=str,
+        default="semantic",
+        choices=["semantic", "spatial"],
+        help="How to compute s: semantic cosine or spatial IoU.",
+    )
+    p.add_argument("--alpha_sem", type=float, default=1.0, help="Coefficient for semantic scaler s_sem")
+    p.add_argument("--alpha_iou", type=float, default=1.0, help="Coefficient for spatial scaler s_sp")
+    p.add_argument(
+        "--s_fallback_value",
+        type=float,
+        default=1.0,
+        help="Fallback s when scaler inputs are missing/invalid (unless strict mode is enabled).",
+    )
+    p.add_argument(
+        "--strict_scaler_inputs",
+        action="store_true",
+        help="Raise if scaler inputs are missing/invalid instead of using s_fallback_value.",
+    )
     p.add_argument("--ref_8bit", action="store_true", help="Load reference model in 8-bit for memory savings")
     p.add_argument("--bf16", action="store_true", help="Use bfloat16 (recommended for Ampere+)")
     p.add_argument("--logging_steps", type=int, default=10)
@@ -122,6 +145,14 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
+        alpha_vdpo=args.alpha_vdpo,
+        vdpo_margin_m=args.vdpo_margin_m,
+        alpha_format=args.alpha_format,
+        grounding_mode=args.grounding_mode,
+        alpha_sem=args.alpha_sem,
+        alpha_iou=args.alpha_iou,
+        s_fallback_value=args.s_fallback_value,
+        strict_scaler_inputs=args.strict_scaler_inputs,
     )
     trainer.train()
     trainer.save_model(args.output_dir)
