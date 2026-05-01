@@ -122,3 +122,39 @@ def iou_xyxy_norm(a: tuple[float, float, float, float], b: tuple[float, float, f
     if union <= 0:
         return 0.0
     return inter / union
+
+
+def mean_max_iou_per_gt(
+    gt_boxes: list[tuple[float, float, float, float]],
+    pred_boxes: list[tuple[float, float, float, float]],
+) -> float:
+    """
+    Average over GT boxes of (max IoU to any prediction).
+
+    With one GT and several predictions, rewards locating the referent in any output line.
+    """
+    if not gt_boxes:
+        return 0.0
+    if not pred_boxes:
+        return 0.0
+    total = 0.0
+    for gt in gt_boxes:
+        total += max(iou_xyxy_norm(p, gt) for p in pred_boxes)
+    return total / float(len(gt_boxes))
+
+
+def all_gts_matched_at_iou(
+    gt_boxes: list[tuple[float, float, float, float]],
+    pred_boxes: list[tuple[float, float, float, float]],
+    *,
+    threshold: float = 0.5,
+) -> bool:
+    """True if every GT box has at least one prediction with IoU >= threshold."""
+    if not gt_boxes:
+        return True
+    if not pred_boxes:
+        return False
+    for gt in gt_boxes:
+        if max(iou_xyxy_norm(p, gt) for p in pred_boxes) < threshold:
+            return False
+    return True

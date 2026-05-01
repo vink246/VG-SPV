@@ -269,7 +269,7 @@ python eval/run_bounding_box_sft_eval.py ^
   --dataset_id lmms-lab/RefCOCO --split val --max_samples 500 --bf16
 ```
 
-The script reports **mean IoU** and **Acc@IoU≥0.5** over parsed boxes normalized to `[0,1]` (integer grid or legacy decimals; see `train/tag_parsing.py`).
+The script reports **`mean_iou_mean_max_per_gt`** (average over GT boxes of the best IoU to any predicted box, so extra predictions or multiple instances do not collapse to “first box only”), **`acc_mean_max_iou_0.5`**, and **`acc_all_gt_boxes_iou_0.5`** (every GT has some prediction with IoU ≥ 0.5). Parsing: integer grid or legacy decimals (`train/tag_parsing.py`).
 
 **4) Inference with the adapter:**
 
@@ -294,7 +294,7 @@ When `--lora_adapter_path` is set, **the reference model is an explicit frozen c
 **Implementation notes**
 
 - **TinyLLaVA** is not supported by the bounding-box SFT collator yet (no shared HF `processor.apply_chat_template` path); extend `train/bounding_box_sft_collator.py` if you need it.
-- Bounding boxes in rows are assumed to be **COCO xywh in pixels** unless all four numbers already lie in `[0,1]` as **xyxy** (see `train/bounding_box_sft_dataset.py`).
+- Bounding boxes in rows are assumed to be **COCO xywh in pixels** unless all four numbers already lie in `[0,1]` as **xyxy** (see `train/bounding_box_sft_dataset.py`). For **multiple instances**, supply a list of boxes in **`bbox`** (list-of-lists) or use columns **`bboxes`**, **`boxes`**, **`gt_boxes`**, or **`bbox_list`**; training emits one `phrase: ... | box: ...` line per box.
 - LoRA targets default to Mistral/Llama linear projections (`train/lora_factory.py`); widen if your checkpoint uses different submodule names.
 
 ---

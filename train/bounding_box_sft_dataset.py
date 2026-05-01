@@ -1,5 +1,5 @@
 """
-HF datasets → bounding-box SFT rows (image, referring expression, normalized xyxy box).
+HF datasets → bounding-box SFT rows (image, referring expression, one or more normalized xyxy boxes).
 
 Supported hubs (see `data/download_bounding_box_sft_datasets.py`):
   - lmms-lab/RefCOCO (val/test splits; eval-oriented)
@@ -15,7 +15,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from train.bounding_box_sft_schema import build_assistant_bbox_sft, user_text_with_expression
+from train.bounding_box_sft_schema import build_assistant_bbox_sft_multi, user_text_with_expression
 from train.dataset_adapter import (
     CHOSEN_REASONING_TRACE_COL,
     IMAGE_COL,
@@ -53,26 +53,72 @@ def _to_xyxy_norm_xywh(xywh_px: list[float], w: int, h: int) -> tuple[float, flo
     return _to_xyxy_norm_pixels([x0, y0, x1, y1], w, h)
 
 
-def infer_norm_box_from_row(row: dict[str, Any], image: Any) -> tuple[float, float, float, float] | None:
-    """
-    Normalize a 4-float box to [0,1] xyxy.
-
-    Heuristic:
-    - If all values lie in [0, 1] and x1>x0, y1>y0 → already normalized xyxy.
-    - Else → COCO *xywh* in pixels (RefCOCO / lmms-lab / PaDT releases).
-    """
-    w, h = _pil_size(image)
-    bbox = row.get("bbox")
-    if bbox is None:
+def _norm_xyxy_one(b: list[float], w: int, h: int) -> tuple[float, float, float, float] | None:
+    """Normalize one box field to [0,1] xyxy (already-xyxy vs COCO xywh in pixels)."""
+    if len(b) < 4:
         return None
-    if hasattr(bbox, "tolist"):
-        bbox = bbox.tolist()
-    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-        return None
-    b = [float(x) for x in bbox[:4]]
+    b = [float(x) for x in b[:4]]
     if all(0.0 <= x <= 1.0 for x in b) and b[2] > b[0] and b[3] > b[1]:
         return b[0], b[1], b[2], b[3]
     return _to_xyxy_norm_xywh(b, w, h)
+
+
+def infer_norm_boxes_from_row(row: dict[str, Any], image: Any) -> list[tuple[float, float, float, float]]:
+    """
+    All GT boxes for this row in [0,1] xyxy.
+
+    - If ``bbox`` is a list of four-number boxes (some hubs), returns each normalized box.
+    - If ``bboxes`` / ``boxes`` / ``gt_boxes`` / ``bbox_list`` holds a list of boxes, uses that.
+    - Otherwise a single flat ``bbox`` (length 4) yields a one-element list.
+    """
+    w, h = _pil_size(image)
+    for key in ("bboxes", "boxes", "gt_boxes", "bbox_list"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        if hasattr(raw, "tolist"):
+            raw = raw.tolist()
+        if not isinstance(raw, (list, tuple)) or len(raw) == 0:
+            continue
+        el0 = raw[0]
+        if isinstance(el0, (list, tuple)) and len(el0) >= 4:
+            out: list[tuple[float, float, float, float]] = []
+            for item in raw:
+                if not isinstance(item, (list, tuple)) or len(item) < 4:
+                    continue
+                t = _norm_xyxy_one(list(item[:4]), w, h)
+                if t is not None:
+                    out.append(t)
+            if out:
+                return out
+    raw = row.get("bbox")
+    if raw is None:
+        return []
+    if hasattr(raw, "tolist"):
+        raw = raw.tolist()
+    if not isinstance(raw, (list, tuple)):
+        return []
+    if len(raw) >= 1:
+        el0 = raw[0]
+        if isinstance(el0, (list, tuple)) and len(el0) >= 4:
+            out = []
+            for item in raw:
+                if not isinstance(item, (list, tuple)) or len(item) < 4:
+                    continue
+                t = _norm_xyxy_one(list(item[:4]), w, h)
+                if t is not None:
+                    out.append(t)
+            return out
+    if len(raw) >= 4:
+        t = _norm_xyxy_one([float(x) for x in raw[:4]], w, h)
+        return [t] if t is not None else []
+    return []
+
+
+def infer_norm_box_from_row(row: dict[str, Any], image: Any) -> tuple[float, float, float, float] | None:
+    """First GT box only (backward compatible helper)."""
+    boxes = infer_norm_boxes_from_row(row, image)
+    return boxes[0] if boxes else None
 
 
 def _get_question(row: dict[str, Any]) -> str:
@@ -115,11 +161,11 @@ def hf_row_to_bbox_sft_sample(row: dict[str, Any]) -> BoundingBoxSFTSample:
     phrase = _get_question(row)
     if not phrase:
         raise ValueError("Could not find referring expression in row")
-    box = infer_norm_box_from_row(row, image)
-    if box is None:
-        raise ValueError("Could not infer bounding box from row")
+    boxes = infer_norm_boxes_from_row(row, image)
+    if not boxes:
+        raise ValueError("Could not infer bounding box(es) from row")
     user_txt = user_text_with_expression(phrase)
-    assistant = build_assistant_bbox_sft(phrase, *box)
+    assistant = build_assistant_bbox_sft_multi(phrase, boxes)
     messages = [
         {
             "role": "user",
