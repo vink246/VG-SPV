@@ -19,7 +19,7 @@ from trl import DPOConfig
 
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION, load_dpo_dataset
 from train.dpo_trainer import VGSPVTrainer
-from vlm import load_vlm
+from vlm import load_vlm, load_vlm_with_optional_lora
 
 
 def parse_args():
@@ -45,27 +45,56 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=100)
     p.add_argument("--save_total_limit", type=int, default=2)
     p.add_argument("--prompt_instruction", type=str, default=None, help="Instruction used as prompt when loading from CSV (default: see train/dataset_adapter.py)")
+    p.add_argument(
+        "--lora_adapter_path",
+        type=str,
+        default=None,
+        help="Optional bbox-SFT PEFT dir (e.g. .../adapter or .../adapter_latest). Policy loads base + adapter; ref is frozen base without adapter.",
+    )
+    p.add_argument(
+        "--merge_lora_adapter",
+        action="store_true",
+        help="Merge bounding-box SFT LoRA into base weights before DPO (policy is dense weights).",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.merge_lora_adapter and not args.lora_adapter_path:
+        raise SystemExit(
+            "--merge_lora_adapter requires --lora_adapter_path (PEFT directory, e.g. .../adapter or .../adapter_latest)."
+        )
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     dtype = torch.bfloat16 if args.bf16 else torch.float32
-    loaded = load_vlm(args.model_name, dtype=dtype)
+    loaded = load_vlm_with_optional_lora(
+        args.model_name,
+        dtype=dtype,
+        lora_adapter_path=args.lora_adapter_path,
+        merge_adapter=args.merge_lora_adapter,
+        is_trainable=True,
+    )
     model = loaded.model
     tokenizer = loaded.tokenizer
 
     ref_model = None
-    if args.ref_8bit:
+    if args.lora_adapter_path and not args.merge_lora_adapter:
+        ref_kw: dict = {"dtype": dtype}
+        if args.ref_8bit:
+            ref_kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        ref_loaded = load_vlm(args.model_name, **ref_kw)
+        ref_model = ref_loaded.model
+        for p in ref_model.parameters():
+            p.requires_grad = False
+    elif args.ref_8bit:
         ref_loaded = load_vlm(
             args.model_name,
             dtype=dtype,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
         )
         ref_model = ref_loaded.model
-    # If ref_model is None, DPOTrainer creates a copy of the model as ref
+    # If ref_model is None, DPOTrainer creates a copy of the policy as ref (no separate frozen base).
 
     train_dataset = load_dpo_dataset(
         args.data_path,

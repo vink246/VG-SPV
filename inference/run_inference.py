@@ -5,6 +5,7 @@ Usage:
     python inference/run_inference.py --model tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B --image path/to/img.png --prompt "Describe this image"
     python inference/run_inference.py --model tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B --image img.png --prompt "What is in this image?" --output response.txt
     python inference/run_inference.py --model llava-hf/llava-1.5-7b-hf --image img.png --prompt "Describe this image"
+    python inference/run_inference.py --model meta-llama/Llama-3.2-11B-Vision-Instruct --lora-adapter outputs/bounding_box_sft/adapter --image img.png --prompt "..."
 
 Make sure to set the Hugging Face cache to a directory with enough space (e.g. scratch): export HF_HOME=~/scratch/.cache/huggingface
 """
@@ -28,7 +29,7 @@ if "HUGGINGFACE_HUB_CACHE" not in os.environ and "HF_HOME" not in os.environ:
         os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_cache)
 
 from utils import build_messages, parse_dtype
-from vlm import load_vlm, run_vl_inference
+from vlm import load_vlm_with_optional_lora, run_vl_inference
 
 
 def parse_args():
@@ -54,6 +55,17 @@ def parse_args():
         choices=["qwen3_vl", "llava", "tinyllava", "mllama"],
         help="Force VLM backend (optional). If omitted, family is inferred from the model id / config.",
     )
+    p.add_argument(
+        "--lora-adapter",
+        type=str,
+        default=None,
+        help="Path to bounding-box SFT PEFT dir (e.g. .../adapter or .../adapter_latest from train/run_bounding_box_sft.py).",
+    )
+    p.add_argument(
+        "--merge-lora-adapter",
+        action="store_true",
+        help="Merge bounding-box SFT LoRA into base weights before inference (no PEFT at runtime).",
+    )
     return p.parse_args()
 
 
@@ -73,7 +85,14 @@ def main():
     cache_dir = os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(hf_home, "hub"))
     print(f"Model cache dir: {cache_dir}")
     print(f"Loading model {args.model}...")
-    loaded = load_vlm(args.model, dtype=dtype, model_family=args.model_family)
+    loaded = load_vlm_with_optional_lora(
+        args.model,
+        dtype=dtype,
+        model_family=args.model_family,
+        lora_adapter_path=args.lora_adapter,
+        merge_adapter=args.merge_lora_adapter,
+        is_trainable=False,
+    )
 
     messages = build_messages(image_paths, args.prompt)
     response = run_vl_inference(loaded, messages, max_new_tokens=args.max_new_tokens)

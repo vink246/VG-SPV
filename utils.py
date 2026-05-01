@@ -13,6 +13,7 @@ from vlm import (
     LoadedVLM,
     get_model_family,
     load_vlm,
+    load_vlm_with_optional_lora,
     load_vl_model_and_processor,
     parse_dtype,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "build_messages",
     "get_model_family",
     "load_vlm",
+    "load_vlm_with_optional_lora",
     "load_vl_model_and_processor",
     "parse_dtype",
 ]
