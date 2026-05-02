@@ -1,0 +1,5 @@
+# Force LF line endings on all shell-style scripts so they stay runnable
+# when checked out on a Linux SLURM node from a Windows working copy
+# (CRLF would break bash line continuations and shebang lookup).
+*.sh        text eol=lf
+*.sbatch    text eol=lf
