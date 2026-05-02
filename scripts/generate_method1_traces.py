@@ -324,9 +324,13 @@ def cmd_prepare(args: argparse.Namespace) -> list[Path]:
         if not _row_passes_mmsb_filter(row):
             n_filtered += 1
             continue
-        rid = row.get("id")
-        if rid is None or str(rid) == "":
-            rid = f"row{i}"
+        # Derive a guaranteed-unique row key. The metadata "id" field on
+        # MM-SafetyBench is a per-(category, subset) row index from the source
+        # parquet, so it is NOT unique across the cohort -- relying on it
+        # produced "duplicate_custom_id" batch rejections from OpenAI. The
+        # metadata file's enumeration index ``i`` is unique by construction
+        # and is what cmd_collect also uses as its lookup key.
+        rid = f"row{i}"
         rel_image = row.get("image")
         question = row.get("question")
         if not rel_image or not question:
@@ -428,13 +432,30 @@ def cmd_submit(args: argparse.Namespace) -> dict[str, Any]:
     state = _load_state(split_batches)
     existing_by_path = {c["input_path"]: c for c in state.get("chunks", [])}
 
+    # Statuses where the existing batch is dead and a fresh submit is required.
+    # Anything else (including in-progress and unknown) means we keep the
+    # existing batch_id and let `wait` deal with it.
+    _DEAD_STATUSES = {"failed", "expired", "cancelled"}
+
     new_chunks: list[dict[str, Any]] = []
     for path in inputs:
         rec = existing_by_path.get(str(path))
-        if rec and rec.get("batch_id") and not args.resubmit:
-            print(f"Skipping {path.name}: already submitted as batch {rec['batch_id']}")
+        existing_status = rec.get("status") if rec else None
+        existing_bid = rec.get("batch_id") if rec else None
+        is_dead = existing_status in _DEAD_STATUSES
+
+        if existing_bid and not args.resubmit and not is_dead:
+            print(
+                f"Skipping {path.name}: already submitted as batch "
+                f"{existing_bid} (status={existing_status})"
+            )
             new_chunks.append(rec)
             continue
+        if existing_bid and is_dead:
+            print(
+                f"Resubmitting {path.name}: previous batch {existing_bid} "
+                f"is {existing_status}; creating a fresh one."
+            )
 
         print(f"Uploading {path.name}...")
         with path.open("rb") as f:
@@ -489,6 +510,57 @@ def _download_file(client, file_id: str, dest: Path) -> None:
         dest.write_bytes(text)
 
 
+def _surface_batch_errors(
+    batch: Any,
+    chunk: dict[str, Any],
+    split_batches: Path,
+    idx: str,
+) -> int:
+    """Pull ``batch.errors`` off a (typically failed) batch object, print a
+    human-readable summary, persist the structured form into ``chunk`` and into
+    ``_batches/{split}/batch_errors_{idx}.jsonl`` for later inspection.
+
+    Returns the number of error entries surfaced (0 if none).
+    """
+    errors_obj = getattr(batch, "errors", None)
+    if not errors_obj:
+        return 0
+    raw_list = getattr(errors_obj, "data", None) or []
+    if not raw_list:
+        return 0
+
+    serialized = [
+        {
+            "code": getattr(e, "code", None),
+            "message": getattr(e, "message", None),
+            "param": getattr(e, "param", None),
+            "line": getattr(e, "line", None),
+        }
+        for e in raw_list
+    ]
+    chunk["batch_errors"] = serialized
+
+    err_path = split_batches / f"batch_errors_{idx}.jsonl"
+    err_path.parent.mkdir(parents=True, exist_ok=True)
+    with err_path.open("w", encoding="utf-8") as f:
+        for e in serialized:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    print(
+        f"  batch {batch.id}: {len(serialized)} batch-level error(s) "
+        f"(saved to {err_path}):"
+    )
+    head = 10
+    for e in serialized[:head]:
+        print(
+            f"    line={e['line']} code={e['code']} "
+            f"param={e['param']}: {e['message']}"
+        )
+    if len(serialized) > head:
+        print(f"    ... and {len(serialized) - head} more (see {err_path})")
+    return len(serialized)
+
+
 def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
     dataset_dir: Path = args.dataset_dir
     split: str = args.split
@@ -506,9 +578,19 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
             bid = chunk.get("batch_id")
             if not bid:
                 continue
+            idx = Path(chunk["input_path"]).stem.replace("input_", "")
             status = chunk.get("status")
-            if status in _TERMINAL_STATUSES:
+
+            # Re-fetch terminal-but-failed chunks once if we've never surfaced
+            # their batch.errors yet (idempotent: skipped on subsequent reruns).
+            terminal_needs_errors = (
+                status in _TERMINAL_STATUSES
+                and status != "completed"
+                and "batch_errors" not in chunk
+            )
+            if status in _TERMINAL_STATUSES and not terminal_needs_errors:
                 continue
+
             batch = client.batches.retrieve(bid)
             chunk["status"] = batch.status
             counts = getattr(batch, "request_counts", None)
@@ -519,24 +601,33 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
                 f"  batch {bid}: status={batch.status} "
                 f"completed={ccomplete}/{ctotal} failed={cfailed}"
             )
+
             if batch.status not in _TERMINAL_STATUSES:
                 all_terminal = False
-            else:
-                output_id = getattr(batch, "output_file_id", None)
-                error_id = getattr(batch, "error_file_id", None)
-                chunk["output_file_id"] = output_id
-                chunk["error_file_id"] = error_id
-                idx = Path(chunk["input_path"]).stem.replace("input_", "")
-                if output_id:
-                    out_path = split_batches / f"output_{idx}.jsonl"
-                    print(f"  Downloading outputs -> {out_path}")
-                    _download_file(client, output_id, out_path)
-                    chunk["output_path"] = str(out_path)
-                if error_id:
-                    err_path = split_batches / f"errors_{idx}.jsonl"
-                    print(f"  Downloading errors -> {err_path}")
-                    _download_file(client, error_id, err_path)
-                    chunk["error_path"] = str(err_path)
+                continue
+
+            # --- terminal: download per-row outputs/errors files ---
+            output_id = getattr(batch, "output_file_id", None)
+            error_id = getattr(batch, "error_file_id", None)
+            chunk["output_file_id"] = output_id
+            chunk["error_file_id"] = error_id
+            if output_id:
+                out_path = split_batches / f"output_{idx}.jsonl"
+                print(f"  Downloading outputs -> {out_path}")
+                _download_file(client, output_id, out_path)
+                chunk["output_path"] = str(out_path)
+            if error_id:
+                err_path = split_batches / f"errors_{idx}.jsonl"
+                print(f"  Downloading errors -> {err_path}")
+                _download_file(client, error_id, err_path)
+                chunk["error_path"] = str(err_path)
+
+            # --- terminal: surface batch-level errors (validation/quota) ---
+            # These live on batch.errors (separate from the per-row error file)
+            # and were the silent failure mode this codepath used to hide.
+            if batch.status != "completed":
+                _surface_batch_errors(batch, chunk, split_batches, idx)
+
         _save_state(split_batches, state)
         if all_terminal:
             print("All batches terminal.")
@@ -671,13 +762,14 @@ def cmd_collect(args: argparse.Namespace) -> None:
     metadata_by_id: dict[str, dict[str, Any]] = {}
     n_meta_filtered = 0
     for i, row in enumerate(_iter_metadata(metadata_path)):
-        rid = row.get("id")
-        if rid is None or str(rid) == "":
-            rid = f"row{i}"
+        # MUST match the key derivation in cmd_prepare. The metadata row's "id"
+        # field is intentionally ignored (not unique on MM-SafetyBench across
+        # categories/subsets); we key off the file row index instead.
+        rid = f"row{i}"
         if not _row_passes_mmsb_filter(row):
             n_meta_filtered += 1
             continue
-        metadata_by_id[str(rid)] = row
+        metadata_by_id[rid] = row
 
     output_files = sorted(split_batches.glob("output_*.jsonl"))
     if not output_files:
