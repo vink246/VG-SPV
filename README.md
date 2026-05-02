@@ -346,6 +346,8 @@ python -m scripts.generate_method2_traces --split test \
   --checkpoint weights/groundingdino_swint_ogc.pth
 ```
 
+After detection, Method 2 runs **per-phrase NMS** (default IoU `0.5`) and a **per-phrase top-K cap** (default `5`) so that 3 highly overlapping boxes on one firearm collapse to 1 line in `<risk_factors_with_boxes>` while genuine multi-instance cases (3 separate firearms) are preserved. NMS is keyed on the *mapped* risk-factor phrase, so e.g. `"kitchen knife"` and `"knife"` are merged when `risk_factors == ["knife"]`. Tune with `--nms-iou` / `--max-per-phrase` (set either `<=0` to disable). The end-of-run summary prints kept-vs-raw box counts so you can sanity-check the thresholds.
+
 **Convenience dispatcher** (`scripts/generate_traces.py` just forwards):
 
 ```bash

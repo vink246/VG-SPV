@@ -24,6 +24,15 @@ Outputs (per split):
         ``image, perturbed_image, chosen_reasoning_trace, rejected_reasoning_trace``
         where ``chosen_reasoning_trace`` is the Method 2 XML trace.
 
+Per-phrase deduplication (NMS + top-K cap):
+  Grounding DINO is DETR-style and routinely emits multiple highly-overlapping
+  boxes for one object. After running detection we therefore (a) map each raw
+  label to its canonical risk-factor phrase via ``_match_phrase``, (b) run
+  per-phrase NMS at ``--nms-iou`` (default 0.5), and (c) cap survivors per
+  phrase at ``--max-per-phrase`` (default 5). This collapses 3 overlapping
+  firearm boxes to 1 while preserving genuine multi-instance cases (3 firearms
+  at separate locations stay as 3 lines). Set either knob to <=0 to disable.
+
 Special cases:
   - "no risk" propagates as a single literal ``no risk`` line inside the tag.
   - A risk factor that yields zero Grounding DINO detections is recorded as
@@ -147,6 +156,93 @@ def _match_phrase(returned_phrase: str, risk_factors: list[str]) -> str:
         if rp == rfl or rp in rfl or rfl in rp:
             return rf
     return returned_phrase.strip()
+
+
+def _apply_per_phrase_nms(
+    boxes_xyxy: np.ndarray,
+    scores: np.ndarray,
+    labels: list[str],
+    risk_factors: list[str],
+    iou_threshold: float,
+    max_per_phrase: int,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """
+    Deduplicate Grounding DINO outputs per *mapped* risk-factor phrase.
+
+    Pipeline:
+      1. Map every raw label to its canonical risk-factor phrase via
+         ``_match_phrase`` (so ``"kitchen knife"`` and ``"knife"`` collapse to
+         the same NMS class when ``risk_factors == ["knife"]``).
+      2. If ``iou_threshold > 0``: torchvision per-class (per-phrase) NMS.
+         Boxes with mutual IoU above the threshold collapse to the
+         highest-confidence one. Multi-instance cases (same phrase, low IoU)
+         are preserved.
+      3. If ``max_per_phrase > 0``: cap the number of survivors per phrase to
+         ``max_per_phrase``, keeping the highest-confidence ones (NMS already
+         orders by score descending; without NMS we re-sort by score desc).
+
+    Set both knobs <= 0 to skip NMS and the cap entirely (label mapping still
+    runs so downstream code sees canonical phrases).
+
+    Returns ``(boxes, scores, mapped_labels)`` aligned to surviving rows.
+    """
+    n = int(boxes_xyxy.shape[0])
+    if n == 0:
+        return boxes_xyxy, scores, list(labels)
+
+    mapped_labels = [_match_phrase(lbl, risk_factors) for lbl in labels]
+
+    if iou_threshold <= 0 and max_per_phrase <= 0:
+        return boxes_xyxy, scores, mapped_labels
+
+    if iou_threshold > 0:
+        # Lazy import: torchvision is a heavy dep and the pure-Python helpers
+        # in this module (used by smoke tests of formatting/parsing) shouldn't
+        # need it loaded just to import.
+        import torch
+        from torchvision.ops import batched_nms
+
+        unique_phrases = sorted(set(mapped_labels))
+        phrase_to_id = {p: i for i, p in enumerate(unique_phrases)}
+        class_ids = np.array([phrase_to_id[p] for p in mapped_labels], dtype=np.int64)
+        keep_t = batched_nms(
+            torch.from_numpy(boxes_xyxy.astype(np.float32)),
+            torch.from_numpy(scores.astype(np.float32)),
+            torch.from_numpy(class_ids),
+            float(iou_threshold),
+        )
+        keep_indices = keep_t.cpu().numpy()
+    else:
+        # NMS disabled but cap requested: still need score-desc ordering so the
+        # cap step keeps the strongest survivors.
+        keep_indices = np.argsort(-scores, kind="stable")
+
+    if max_per_phrase > 0:
+        per_phrase_count: dict[str, int] = {}
+        capped: list[int] = []
+        for raw_idx in keep_indices:
+            idx = int(raw_idx)
+            phrase = mapped_labels[idx]
+            cnt = per_phrase_count.get(phrase, 0)
+            if cnt >= max_per_phrase:
+                continue
+            per_phrase_count[phrase] = cnt + 1
+            capped.append(idx)
+        keep_indices = (
+            np.array(capped, dtype=np.int64) if capped else np.array([], dtype=np.int64)
+        )
+
+    if len(keep_indices) == 0:
+        return (
+            np.empty((0, 4), dtype=boxes_xyxy.dtype),
+            np.empty((0,), dtype=scores.dtype),
+            [],
+        )
+    return (
+        boxes_xyxy[keep_indices],
+        scores[keep_indices],
+        [mapped_labels[int(i)] for i in keep_indices],
+    )
 
 
 @dataclass
@@ -330,6 +426,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     n_no_risk = 0
     n_skipped_no_image = 0
     n_skipped_unparseable = 0
+    total_dino_boxes_raw = 0
+    total_dino_boxes_kept = 0
 
     for row in method1_rows:
         image_field = (row.get("image") or "").strip()
@@ -389,7 +487,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         caption = _build_caption(dino_phrases)
         try:
-            boxes_xyxy, _scores, labels, _logits = run_grounding_dino(
+            boxes_xyxy, scores, labels, _logits = run_grounding_dino(
                 model=model,
                 image_path=str(image_path),
                 text_prompt=caption,
@@ -417,6 +515,22 @@ def cmd_run(args: argparse.Namespace) -> None:
             }
             n_processed += 1
             continue
+
+        # Per-phrase NMS + optional top-K cap. Collapses overlapping detections
+        # of the same risk factor (3 boxes on one firearm -> 1) while preserving
+        # genuine multi-instance cases (3 firearms at different locations -> 3).
+        n_raw = int(boxes_xyxy.shape[0])
+        boxes_xyxy, scores, labels = _apply_per_phrase_nms(
+            boxes_xyxy=boxes_xyxy,
+            scores=scores,
+            labels=labels,
+            risk_factors=dino_phrases,
+            iou_threshold=args.nms_iou,
+            max_per_phrase=args.max_per_phrase,
+        )
+        n_kept = int(boxes_xyxy.shape[0])
+        total_dino_boxes_raw += n_raw
+        total_dino_boxes_kept += n_kept
 
         box_lines, _boxes_records = _detections_to_lines(
             risk_factors=dino_phrases,
@@ -449,6 +563,14 @@ def cmd_run(args: argparse.Namespace) -> None:
         f"skipped_no_image={n_skipped_no_image}, "
         f"skipped_unparseable={n_skipped_unparseable}."
     )
+    if total_dino_boxes_raw > 0:
+        n_dropped = total_dino_boxes_raw - total_dino_boxes_kept
+        pct = 100.0 * n_dropped / total_dino_boxes_raw
+        print(
+            f"NMS: {total_dino_boxes_kept}/{total_dino_boxes_raw} boxes kept "
+            f"({n_dropped} dropped, {pct:.1f}%) at iou={args.nms_iou}, "
+            f"max_per_phrase={args.max_per_phrase}."
+        )
 
 
 # ---------------------------- CLI ----------------------------
@@ -506,6 +628,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Threshold on text scores.",
+    )
+    p.add_argument(
+        "--nms-iou",
+        type=float,
+        default=0.5,
+        help=(
+            "Per-phrase NMS IoU threshold. After mapping each Grounding DINO "
+            "label to its canonical risk-factor phrase, boxes whose mutual IoU "
+            "exceeds this threshold collapse to the highest-confidence one. "
+            "Set <=0 to disable (default 0.5)."
+        ),
+    )
+    p.add_argument(
+        "--max-per-phrase",
+        type=int,
+        default=5,
+        help=(
+            "Cap surviving boxes per risk-factor phrase to this many "
+            "(highest-confidence first). Bounds <risk_factors_with_boxes> "
+            "length even when an image has many genuine instances. Set <=0 "
+            "to disable (default 5)."
+        ),
     )
     p.add_argument(
         "--overwrite",
