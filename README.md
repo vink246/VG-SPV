@@ -167,7 +167,7 @@ installed package based on the checkpoint filename (e.g. `groundingdino_swint_og
 ### 6. (Optional) API keys and data
 
 - To acquire and set up Hades and MM-SafetyBench datasets, from the root directory of the repo, run `./scripts/install_datasets.sh`. Resulting data can be found in the `data` folder.
-- For trace synthesis (`scripts/generate_method1_traces.py`, dispatched from `scripts/generate_traces.py`): export `OPENAI_API_KEY` for the GPT-4o Batch API. See [MM-SafetyBench preferred-response generation (Method 1 + Method 2)](#mm-safetybench-preferred-response-generation-method-1--method-2) for the full pipeline.
+- For trace synthesis (`scripts/generate_method1_traces.py`, dispatched from `scripts/generate_traces.py`): export `OPENAI_API_KEY` for the GPT-5.4-mini Batch API (`/v1/responses`). See [MM-SafetyBench preferred-response generation (Method 1 + Method 2)](#mm-safetybench-preferred-response-generation-method-1--method-2) for the full pipeline.
 - Download or configure paths for datasets under `data/` as required by the scripts (e.g. **HADES**, **MM Safety Bench**, **COCO**, **VLGuard**, **VisCRA**).
 
 ---
@@ -302,7 +302,7 @@ When `--lora_adapter_path` is set, **the reference model is an explicit frozen c
 ## Usage (high level)
 
 1. **Inference**: Run `inference/run_inference.py` with `--model` to query any supported VL model (e.g. TinyLLaVA, LLaVA). Add `--lora-adapter path/to/adapter` after bounding-box SFT. Example: `python inference/run_inference.py --model tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B --image path/to/img.png --prompt "Describe this image"`. If you see **"Disk quota exceeded"**, the Hugging Face model cache is on a full filesystem: set the cache to a directory with space (e.g. scratch) with `export HF_HOME=~/scratch/.cache/huggingface` before running, or use `--cache_dir ~/scratch/.cache/huggingface/hub`. The script also auto-uses `$SCRATCH` for the cache when set.
-2. **Data**: Run `./scripts/install_datasets.sh`, then synthesize preferred-response traces with `python -m scripts.generate_method1_traces ...` (Method 1, GPT-4o via Batch API) and `python -m scripts.generate_method2_traces ...` (Method 2, Grounding DINO boxes). See [MM-SafetyBench preferred-response generation (Method 1 + Method 2)](#mm-safetybench-preferred-response-generation-method-1--method-2) below. Outputs match the [dataset format](#dataset-format) (CSV: `image`, `perturbed_image`, `chosen_reasoning_trace`, `rejected_reasoning_trace`).
+2. **Data**: Run `./scripts/install_datasets.sh`, then synthesize preferred-response traces with `python -m scripts.generate_method1_traces ...` (Method 1, GPT-5.4-mini via the Batch API on `/v1/responses`) and `python -m scripts.generate_method2_traces ...` (Method 2, Grounding DINO boxes). See [MM-SafetyBench preferred-response generation (Method 1 + Method 2)](#mm-safetybench-preferred-response-generation-method-1--method-2) below. Outputs match the [dataset format](#dataset-format) (CSV: `image`, `perturbed_image`, `chosen_reasoning_trace`, `rejected_reasoning_trace`).
 3. **Training**: Use scripts in `scripts/` to launch VG-fDPO training (e.g. `bash scripts/run_dpo_train.sh`). Use `--model_name` to pick any supported VL model. The `train/` directory contains the DPO pipeline (TRL DPOTrainer) with a custom trainer stub for VG-fDPO loss.
 4. **Reward**: `models/reward_dino.py` provides the Grounding DINO IoU-based reward for VG-PRM. For ground-truth box generation, run `inference/run_grounding_dino.py` with `--checkpoint` (config is auto-selected from the checkpoint name).
 5. **Eval**: Run VisCRA ASR and RefCOCO benchmarks from `eval/`.
@@ -315,10 +315,12 @@ The two scripts below produce the **preferred (chosen) traces** for VG-fDPO from
 
 **Pre-reqs:**
 - MM-SafetyBench data extracted to `data/mm-safebench_1/extracted_data/` (with `{split}_metadata.jsonl` and image files under `{data-root}/{split}/...`). Use `scripts/install_datasets.sh` then `scripts/process_hf_data.py` if needed.
-- `export OPENAI_API_KEY=...` for the Method 1 (GPT-4o Batch API) phases.
+- `export OPENAI_API_KEY=...` for the Method 1 (GPT-5.4-mini Batch API on `/v1/responses`) phases.
 - Grounding DINO weights at `weights/groundingdino_swint_ogc.pth` for Method 2 (see Setup §5).
 
-**Method 1 (GPT-4o Batch API — phased so you can submit and walk away):**
+**Cohort filter (applies to both Method 1 and — transitively, via Method 1's CSV — Method 2):** only metadata rows whose `_category` is in `{"Physical_Harm", "Illegal_Activitiy"}` (yes, the upstream typo "Activitiy" is preserved verbatim) **AND** whose `_subset` string contains `"SD"` are sent to OpenAI or written to the trainer-ready CSV. All other rows are silently dropped, with a count reported by `prepare` and `collect`. To change the cohort, edit `MMSB_COHORT_CATEGORIES` / `MMSB_COHORT_SUBSET_SUBSTRING` at the top of `scripts/generate_method1_traces.py`.
+
+**Method 1** uses **GPT-5.4-mini** via the OpenAI Batch API on `/v1/responses` with fixed reasoning controls: `reasoning.effort=medium`, `reasoning.summary=null`, `text.verbosity=low`. Override these by editing the `DEFAULT_*` constants at the top of `scripts/generate_method1_traces.py`. The four phases are decoupled so you can submit and walk away:
 
 ```bash
 python -m scripts.generate_method1_traces prepare --split test
@@ -328,6 +330,14 @@ python -m scripts.generate_method1_traces collect --split test
 # or end-to-end (blocks until the batch completes — can take hours):
 python -m scripts.generate_method1_traces run     --split test
 ```
+
+Before kicking off a real run you can validate the live API integration end-to-end with one trivial request:
+
+```bash
+python _integration_test_method1_single_batch.py
+```
+
+This script is hardcoded to submit **one batch with one request** and validates that the model returns a parseable `<risk_factors>`/`<logic>`/`<response>` trace.
 
 **Method 2 (Grounding DINO):**
 

@@ -1,16 +1,27 @@
 """
 Generate Method 1 (semantic) preferred-response traces for VG-SPV.
 
-For each MM-SafetyBench (image + question) row, this script asks GPT-4o (via the
-OpenAI Batch API on /v1/chat/completions) to produce a structured trace with
+For each MM-SafetyBench (image + question) row, this script asks GPT-5.4-mini
+(via the OpenAI Batch API on /v1/responses) to produce a structured trace with
 ``<risk_factors>``, ``<logic>``, and ``<response>`` tags using the verbatim
 prompt template from ``immediate instructions.pdf``.
+
+Reasoning controls are fixed per project convention:
+  - ``reasoning.effort = "medium"``
+  - ``reasoning.summary = null``  (no summary emitted)
+  - ``text.verbosity   = "low"``
+
+Cohort filter (applied in both ``prepare`` and ``collect``):
+  Only metadata rows whose ``_category`` is in ``MMSB_COHORT_CATEGORIES``
+  (``{"Physical_Harm", "Illegal_Activitiy"}`` -- preserve the upstream typo)
+  AND whose ``_subset`` string contains ``MMSB_COHORT_SUBSET_SUBSTRING``
+  (``"SD"``) are sent to OpenAI or written to the trainer CSV.
 
 Outputs (per split):
   - data/mm-safebench_1/extracted_data/traces/{split}_method1.csv
         Trainer-ready CSV (matches ``train/dataset_adapter.py`` column contract):
         ``image, perturbed_image, chosen_reasoning_trace, rejected_reasoning_trace``
-        where ``chosen_reasoning_trace`` is the Method 1 XML trace from GPT-4o
+        where ``chosen_reasoning_trace`` is the Method 1 XML trace from the model
         and ``perturbed_image`` / ``rejected_reasoning_trace`` are empty strings
         for now (reserved for §5.2/§5.3 follow-ups).
   - data/mm-safebench_1/extracted_data/traces/_batches/{split}/
@@ -19,7 +30,7 @@ Outputs (per split):
 
 Subcommands (default ``run`` chains ``prepare -> submit -> wait -> collect``):
     prepare   build OpenAI batch input JSONL(s) from the split's metadata
-    submit    upload + create batch jobs against /v1/chat/completions
+    submit    upload + create batch jobs against /v1/responses
     wait      poll batch state and download outputs/errors when terminal
     collect   join outputs by custom_id, parse XML, write trainer-ready CSV
     run       prepare -> submit -> wait -> collect end to end
@@ -55,12 +66,40 @@ from typing import Any, Iterable
 
 DEFAULT_DATASET_DIR = Path("data/mm-safebench_1/extracted_data")
 DEFAULT_OUTPUT_TRACES_SUBDIR = "traces"
-DEFAULT_BATCH_MODEL = "gpt-4o"
+
+# Model + endpoint. We use the Responses API (not chat/completions) because it is
+# the surface that exposes ``reasoning.effort``, ``reasoning.summary``, and
+# ``text.verbosity`` for GPT-5 reasoning models.
+DEFAULT_BATCH_MODEL = "gpt-5.4-mini"
+BATCH_ENDPOINT = "/v1/responses"
+
+# Reasoning + text-generation knobs (project-fixed defaults).
+#   effort:  "minimal" | "low" | "medium" | "high"
+#   summary: "auto" | "concise" | "detailed" | None  (None == no summary)
+#   verbosity: "low" | "medium" | "high"
+DEFAULT_REASONING_EFFORT: str = "medium"
+DEFAULT_REASONING_SUMMARY: str | None = None
+DEFAULT_TEXT_VERBOSITY: str = "low"
+
+# Reasoning models charge "hidden" reasoning tokens against this budget on top of
+# the visible XML output, so leave generous headroom even with verbosity=low.
+DEFAULT_MAX_OUTPUT_TOKENS = 4000
 
 # Per OpenAI Batch limits (current docs: 50,000 rows and 200 MB per input file).
 # Stay comfortably under both to avoid edge-case rejections.
 DEFAULT_MAX_LINES_PER_BATCH = 45_000
 DEFAULT_MAX_BYTES_PER_BATCH = 180 * 1024 * 1024
+
+# MM-SafetyBench cohort filter. Only metadata rows whose ``_category`` is in
+# ``MMSB_COHORT_CATEGORIES`` AND whose ``_subset`` contains
+# ``MMSB_COHORT_SUBSET_SUBSTRING`` are sent to OpenAI. Applied in both
+# ``cmd_prepare`` (skips non-cohort rows when building the batch input) and
+# ``cmd_collect`` (skips any output row whose source metadata is out-of-cohort,
+# defending against stale batches built before this filter was added).
+# NOTE: "Illegal_Activitiy" is the upstream dataset's typo and is preserved
+# verbatim so the string match works against the on-disk metadata.
+MMSB_COHORT_CATEGORIES = frozenset({"Physical_Harm", "Illegal_Activitiy"})
+MMSB_COHORT_SUBSET_SUBSTRING = "SD"
 
 
 # Prompt template. The user query is
@@ -70,7 +109,7 @@ PROMPT_TEMPLATE = """You are an expert multimodal safety evaluator and data synt
 Your task is to identify any visual safety threats, evaluate the user's intent, and generate a highly structured "reasoning trace" that explicitly grounds the safety decision in the visual evidence.
 You MUST format your output EXACTLY using the following three XML tags. Do not include any conversational filler outside of these tags.
 <risk_factors>
-[Provide a comma-separated list of keywords that are identifiable visible nouns that may be explicitly circled as evidence in the image, which could be dangerous, sensitive, or policy-violating. Abstract nouns ('violence') are not allowed, while explicit objects ('firearm') or clearly visible actions ('beating') are helpful and encouraged; if an object detection model could pick it out, it's a good risk factor to report. If absolutely no visual threat is present in the image, you MUST output exactly: no risk]
+[Provide a comma-separated list of keywords that are identifiable visible nouns that may be explicitly circled as evidence in the image, which could be dangerous, sensitive, or policy-violating. Abstract nouns ('violence') are not allowed, while explicit objects ('firearm') or clearly visible actions ('beating') are helpful and encouraged; if an object detection model could pick it out, it's a good risk factor to report. If no visual threat is present in the image, you MUST output exactly: no risk]
 </risk_factors>
 <logic>
 [Provide a concise, logical chain of reasoning. Step 1: Briefly describe the relevant visual elements identified. Step 2: Explain how these visual elements provide context to the user's query. Step 3: Conclude whether fulfilling the query violates safety policies based on the visual evidence.]
@@ -122,6 +161,22 @@ def _csv_image_field(resolved: Path) -> str:
         return resolved.as_posix()
 
 
+def _row_passes_mmsb_filter(row: dict[str, Any]) -> bool:
+    """Return True iff a metadata row is in the configured MM-SafetyBench cohort.
+
+    Cohort = ``_category`` in ``MMSB_COHORT_CATEGORIES`` AND ``_subset`` is a
+    string that contains ``MMSB_COHORT_SUBSET_SUBSTRING``. Rows missing either
+    field, or with the wrong type, are treated as out-of-cohort.
+    """
+    category = row.get("_category")
+    subset = row.get("_subset")
+    if category not in MMSB_COHORT_CATEGORIES:
+        return False
+    if not isinstance(subset, str) or MMSB_COHORT_SUBSET_SUBSTRING not in subset:
+        return False
+    return True
+
+
 # ---------------------------- prepare phase ----------------------------
 
 
@@ -159,30 +214,43 @@ def _encode_image_b64(image_path: Path) -> tuple[str, str]:
 
 
 def build_request(custom_id: str, image_b64: str, mime_type: str, user_query: str) -> dict[str, Any]:
-    """Build a single OpenAI Batch API row targeting /v1/chat/completions."""
+    """Build a single OpenAI Batch API row targeting /v1/responses.
+
+    Notes on the Responses API request shape (vs. chat/completions):
+      - top-level field is ``input`` (not ``messages``)
+      - text parts use ``type: "input_text"`` (not ``"text"``)
+      - image parts use ``type: "input_image"`` with ``image_url`` as a string
+        data URL (not a nested ``{"url": ...}`` object)
+      - reasoning models do not accept ``temperature``; we omit it
+      - cap is ``max_output_tokens`` (not ``max_tokens``)
+    """
     return {
         "custom_id": custom_id,
         "method": "POST",
-        "url": "/v1/chat/completions",
+        "url": BATCH_ENDPOINT,
         "body": {
             "model": DEFAULT_BATCH_MODEL,
-            "temperature": 0.0,
-            "max_tokens": 800,
-            "messages": [
+            "input": [
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "text",
+                            "type": "input_text",
                             "text": PROMPT_TEMPLATE.format(user_query=user_query),
                         },
                         {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
+                            "type": "input_image",
+                            "image_url": f"data:{mime_type};base64,{image_b64}",
                         },
                     ],
                 }
             ],
+            "reasoning": {
+                "effort": DEFAULT_REASONING_EFFORT,
+                "summary": DEFAULT_REASONING_SUMMARY,
+            },
+            "text": {"verbosity": DEFAULT_TEXT_VERBOSITY},
+            "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
         },
     }
 
@@ -247,11 +315,15 @@ def cmd_prepare(args: argparse.Namespace) -> list[Path]:
     writer = _ChunkWriter(split_batches, args.max_lines, args.max_bytes)
     n_written = 0
     n_skipped = 0
+    n_filtered = 0
     skipped_log: list[dict[str, Any]] = []
 
     for i, row in enumerate(_iter_metadata(metadata_path)):
         if args.limit is not None and n_written >= args.limit:
             break
+        if not _row_passes_mmsb_filter(row):
+            n_filtered += 1
+            continue
         rid = row.get("id")
         if rid is None or str(rid) == "":
             rid = f"row{i}"
@@ -289,6 +361,13 @@ def cmd_prepare(args: argparse.Namespace) -> list[Path]:
             for entry in skipped_log:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         print(f"Logged {n_skipped} skipped rows to {skipped_path}")
+
+    if n_filtered:
+        print(
+            f"Filtered out {n_filtered} non-cohort row(s) "
+            f"(kept categories={sorted(MMSB_COHORT_CATEGORIES)}, "
+            f"_subset must contain '{MMSB_COHORT_SUBSET_SUBSTRING}')."
+        )
 
     print(
         f"Prepared {n_written} request(s) across {len(written_paths)} chunk file(s) under {split_batches}:"
@@ -365,7 +444,7 @@ def cmd_submit(args: argparse.Namespace) -> dict[str, Any]:
         print("  Creating batch...")
         batch = client.batches.create(
             input_file_id=up.id,
-            endpoint="/v1/chat/completions",
+            endpoint=BATCH_ENDPOINT,
             completion_window="24h",
             metadata={"split": split, "chunk": path.name},
         )
@@ -496,32 +575,40 @@ def parse_method1_xml(text: str) -> dict[str, Any] | None:
 
 
 def _extract_response_text(output_row: dict[str, Any]) -> str | None:
-    """Pull the assistant text content from a /v1/chat/completions batch output row."""
+    """Pull the assistant text content from a /v1/responses batch output row.
+
+    The Responses API returns ``body.output`` as an array of typed items
+    (``"reasoning"``, ``"message"``, possibly others). We concatenate every
+    ``output_text`` (and tolerated legacy ``text``) part inside any assistant
+    ``message`` block. ``body.output_text`` is a Python-SDK convenience that is
+    NOT present in raw batch JSON, so we never rely on it.
+    """
     response = output_row.get("response")
     if not isinstance(response, dict):
         return None
     body = response.get("body")
     if not isinstance(body, dict):
         return None
-    choices = body.get("choices")
-    if not choices or not isinstance(choices, list):
+    output = body.get("output")
+    if not isinstance(output, list):
         return None
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    if not isinstance(msg, dict):
-        return None
-    content = msg.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
         for part in content:
-            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                parts.append(part["text"])
-            elif isinstance(part, str):
-                parts.append(part)
-        if parts:
-            return "".join(parts)
-    return None
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in ("output_text", "text"):
+                txt = part.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+    if not parts:
+        return None
+    return "".join(parts)
 
 
 def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -582,10 +669,14 @@ def cmd_collect(args: argparse.Namespace) -> None:
     malformed_path = split_batches / "malformed.jsonl"
 
     metadata_by_id: dict[str, dict[str, Any]] = {}
+    n_meta_filtered = 0
     for i, row in enumerate(_iter_metadata(metadata_path)):
         rid = row.get("id")
         if rid is None or str(rid) == "":
             rid = f"row{i}"
+        if not _row_passes_mmsb_filter(row):
+            n_meta_filtered += 1
+            continue
         metadata_by_id[str(rid)] = row
 
     output_files = sorted(split_batches.glob("output_*.jsonl"))
@@ -597,6 +688,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
     parsed_rows: dict[str, dict[str, str]] = {}
     malformed: list[dict[str, Any]] = []
     n_total_outputs = 0
+    n_out_of_cohort = 0
 
     for of in output_files:
         for output_row in _read_jsonl(of):
@@ -619,7 +711,14 @@ def cmd_collect(args: argparse.Namespace) -> None:
                 malformed.append({"id": rid, "reason": "xml tags missing", "raw": text})
                 continue
 
-            meta = metadata_by_id.get(rid, {})
+            # Only the cohort survives the metadata-side filter above. Any output
+            # row whose source metadata is out-of-cohort (e.g. from a stale batch
+            # built before this filter was added) gets dropped here so the CSV
+            # is always cohort-pure.
+            meta = metadata_by_id.get(rid)
+            if meta is None:
+                n_out_of_cohort += 1
+                continue
             rel_image = meta.get("image")
             image_path_str = ""
             if rel_image:
@@ -643,9 +742,21 @@ def cmd_collect(args: argparse.Namespace) -> None:
     _atomic_write_csv(csv_path, sorted_csv_rows, CSV_FIELDNAMES)
     print(f"Wrote trainer-ready CSV {csv_path} ({len(sorted_csv_rows)} rows).")
 
+    if n_meta_filtered:
+        print(
+            f"Cohort filter: dropped {n_meta_filtered} metadata row(s) "
+            f"(kept categories={sorted(MMSB_COHORT_CATEGORIES)}, "
+            f"_subset must contain '{MMSB_COHORT_SUBSET_SUBSTRING}')."
+        )
+    if n_out_of_cohort:
+        print(
+            f"Cohort filter: dropped {n_out_of_cohort} output row(s) "
+            "whose source metadata is out-of-cohort (stale batch?)."
+        )
+
     print(
         f"Done. Outputs scanned: {n_total_outputs}, parsed: {len(parsed_rows)}, "
-        f"malformed: {len(malformed)}"
+        f"malformed: {len(malformed)}, out-of-cohort: {n_out_of_cohort}"
     )
 
 
@@ -736,7 +847,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seconds between status polls (default 60).",
     )
 
-    sp = sub.add_parser("collect", help="Parse outputs and write JSONL + CSV.")
+    sp = sub.add_parser("collect", help="Parse outputs and write the trainer-ready CSV.")
     _add_common_args(sp)
 
     sp = sub.add_parser("run", help="prepare -> submit -> wait -> collect end to end.")

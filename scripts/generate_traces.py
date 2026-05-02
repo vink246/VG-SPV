@@ -3,7 +3,8 @@ Thin dispatcher for VG-SPV preferred-response trace generation.
 
 This is a convenience entry point that forwards to the two real generators:
 
-  - ``scripts.generate_method1_traces`` — GPT-4o (Batch API) Method 1 traces
+  - ``scripts.generate_method1_traces`` — GPT-5.4-mini (Batch API on
+    ``/v1/responses``) Method 1 traces
   - ``scripts.generate_method2_traces`` — Grounding DINO Method 2 traces
 
 Always invoke from the repo root via ``python -m`` so cross-package imports
