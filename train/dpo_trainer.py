@@ -1,9 +1,8 @@
 """
 VG-SPV DPO Trainer implementing:
-  - VG-fDPO masked loss with M_G / M_L / M_total
-  - format-fail fallback loss
-  - V-DPO contrastive term
-  - total loss composition
+  - VG-fDPO masked loss (M_G / M_L / M_total) + format-fail fallback when ``use_vgfdpo=True`` (default)
+  - Standard full-sequence DPO when ``use_vgfdpo=False``
+  - V-DPO contrastive term when ``use_vdpo=True`` (default; paper Eq. 7)
 """
 
 from __future__ import annotations
@@ -73,9 +72,11 @@ class VGSPVTrainer(DPOTrainer):
     def __init__(
         self,
         *args: Any,
+        use_vgfdpo: bool = True,
+        use_vdpo: bool = True,
         alpha_vdpo: float = 0.1,
         vdpo_margin_m: float = 0.0,
-        alpha_format: float = 12.0,
+        alpha_format: float = 13.0,
         grounding_mode: str = "semantic",
         alpha_sem: float = 1.0,
         alpha_iou: float = 1.0,
@@ -83,6 +84,8 @@ class VGSPVTrainer(DPOTrainer):
         strict_scaler_inputs: bool = False,
         **kwargs: Any,
     ) -> None:
+        self.use_vgfdpo = bool(use_vgfdpo)
+        self.use_vdpo = bool(use_vdpo)
         self.alpha_vdpo = float(alpha_vdpo)
         self.vdpo_margin_m = float(vdpo_margin_m)
         self.alpha_format = float(alpha_format)
@@ -252,6 +255,10 @@ class VGSPVTrainer(DPOTrainer):
 
             delta_total = self.beta * ((c_total_pol - c_total_ref) - (l_total_pol - l_total_ref))
 
+            if not self.use_vgfdpo:
+                losses.append(-F.logsigmoid(delta_total))
+                continue
+
             if chosen_spans.parsed_ok and rejected_spans.parsed_ok:
                 parse_ok_count += 1
                 c_l_pol = self._sum_segment_logp(chosen_pol_logps[i], chosen_spans, "m_l")
@@ -282,16 +289,20 @@ class VGSPVTrainer(DPOTrainer):
 
         base_loss = torch.stack(losses).mean()
         chosen_pol_total_t = torch.stack(chosen_pol_total) if chosen_pol_total else base_loss.new_zeros((bs,))
-        vdpo_vec, vdpo_missing = self._vdpo_term(model, inputs, chosen_pol_total_t)
-        vdpo_loss = vdpo_vec.mean() if vdpo_vec.numel() > 0 else base_loss.new_tensor(0.0)
-        total_loss = base_loss + (self.alpha_vdpo * vdpo_loss)
+        vdpo_loss = base_loss.new_tensor(0.0)
+        vdpo_missing = 0
+        if self.use_vdpo:
+            vdpo_vec, vdpo_missing = self._vdpo_term(model, inputs, chosen_pol_total_t)
+            vdpo_loss = vdpo_vec.mean() if vdpo_vec.numel() > 0 else base_loss.new_tensor(0.0)
+        total_loss = base_loss + self.alpha_vdpo * vdpo_loss
 
         metrics = {
+            "loss_dpo": base_loss.item(),
             "loss_vgfdpo": torch.stack(vg_losses).mean().item() if vg_losses else 0.0,
             "loss_format": torch.stack(fmt_losses).mean().item() if fmt_losses else 0.0,
             "loss_vdpo": vdpo_loss.item(),
             "loss_total": total_loss.item(),
-            "parse_success_rate": float(parse_ok_count) / float(bs),
+            "parse_success_rate": (float(parse_ok_count) / float(bs)) if self.use_vgfdpo else 1.0,
             "s_value_mean": float(sum(s_values) / len(s_values)) if s_values else 0.0,
             "s_sem_mean": float(sum(s_values) / len(s_values)) if s_values and self.grounding_mode == "semantic" else 0.0,
             "s_sp_mean": float(sum(s_values) / len(s_values)) if s_values and self.grounding_mode == "spatial" else 0.0,

@@ -1,12 +1,20 @@
 """
 Launch DPO training with any supported VL model (TinyLLaVA, LLaVA, etc.) using VGSPVTrainer.
 
-Uses TRL DPOTrainer pipeline; loss is overridable in train/dpo_trainer.py (VG-fDPO).
+All hyperparameters live in ``configs/dpo.yaml``. Pass ``--config`` for another file;
+CLI flags override YAML when provided.
+
+Policy is trained with LoRA by default (``train/lora_factory.attach_lora``). Optional
+``lora_adapter_path`` loads a bbox-SFT adapter first, then adds fresh DPO LoRA when
+that checkpoint was merged into dense weights.
 """
+
+from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 # Allow running as python train/run_dpo.py from repo root
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -14,129 +22,186 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
+from peft import PeftModel
 from transformers import BitsAndBytesConfig
 from trl import DPOConfig
 
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION, load_dpo_dataset
 from train.dpo_trainer import VGSPVTrainer
+from train.dpo_yaml import DPOTrainConfig, default_dpo_config_path, dump_dpo_train_config_yaml, load_dpo_train_config, merge_dpo_train_config
+from train.lora_factory import attach_lora, default_lora_config
 from vlm import load_vlm, load_vlm_with_optional_lora
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Run DPO training with TinyLLaVA (VG-SPV).")
+def _str2bool(s: str) -> bool:
+    v = s.strip().lower()
+    if v in ("1", "true", "t", "yes", "y"):
+        return True
+    if v in ("0", "false", "f", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean string, got {s!r}")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run DPO training (VG-SPV; YAML config + CLI overrides).")
+    p.add_argument("--config", type=str, default=None, help=f"YAML config path (default: {default_dpo_config_path()})")
+
+    def add(name: str, t: Any, help: str):
+        p.add_argument(f"--{name.replace('_', '-')}", type=t, default=None, help=help)
+
+    add("model_name", str, "HF model id or local path")
+    add("data_path", str, "DPO dataset CSV / dir / HF id")
+    add("output_dir", str, "Training output directory")
+    add("prompt_instruction", str, "Prompt text when loading from CSV")
+    add("num_train_epochs", int, "")
+    add("per_device_train_batch_size", int, "")
+    add("gradient_accumulation_steps", int, "")
+    add("learning_rate", float, "")
+    add("max_length", int, "")
+    add("max_prompt_length", int, "")
+    add("beta", float, "DPO temperature")
+    add("bf16", _str2bool, "Use bfloat16")
+    add("ref_8bit", _str2bool, "Load reference model in 8-bit")
+    add("logging_steps", int, "")
+    add("save_steps", int, "")
+    add("save_total_limit", int, "")
+    add("use_vgfdpo", _str2bool, "Segment-masked VG-fDPO loss (paper L_VG-fDPO)")
+    add("use_vdpo", _str2bool, "V-DPO contrastive term (paper L_V-DPO)")
+    add("alpha_vdpo", float, "Weight alpha on V-DPO term (paper Eq. 7)")
+    add("vdpo_margin_m", float, "V-DPO hinge margin m")
+    add("alpha_format", float, "Format-fail scaler (paper Eq. 5; typically 12–15)")
+    add("grounding_mode", str, "semantic | spatial (VG-fDPO scaler s)")
+    add("alpha_sem", float, "")
+    add("alpha_iou", float, "")
+    add("s_fallback_value", float, "")
+    add("strict_scaler_inputs", _str2bool, "")
+    add("lora_r", int, "LoRA rank for DPO policy")
+    add("lora_alpha", int, "LoRA alpha")
+    add("lora_dropout", float, "LoRA dropout")
+    add("lora_adapter_path", str, "Optional bbox-SFT PEFT dir before DPO LoRA")
+    add("merge_lora_adapter", _str2bool, "Merge bbox LoRA into dense weights before DPO LoRA")
     p.add_argument(
-        "--model_name",
-        type=str,
-        default="tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B",
-        help="Model name or path (e.g. tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B, llava-hf/llava-1.5-7b-hf)",
-    )
-    p.add_argument("--data_path", type=str, default=None, help="Path to DPO dataset: CSV (image, perturbed_image, chosen_reasoning_trace, rejected_reasoning_trace) or dataset dir/HF name. Default: minimal example.")
-    p.add_argument("--output_dir", type=str, default="outputs/dpo", help="Training output directory")
-    p.add_argument("--num_train_epochs", type=int, default=1)
-    p.add_argument("--per_device_train_batch_size", type=int, default=2)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    p.add_argument("--learning_rate", type=float, default=5e-7)
-    p.add_argument("--max_length", type=int, default=512)
-    p.add_argument("--max_prompt_length", type=int, default=256)
-    p.add_argument("--beta", type=float, default=0.1, help="DPO temperature")
-    p.add_argument("--alpha_vdpo", type=float, default=0.1, help="Weight for V-DPO term in total loss")
-    p.add_argument("--vdpo_margin_m", type=float, default=0.0, help="Margin m for V-DPO hinge")
-    p.add_argument("--alpha_format", type=float, default=12.0, help="Scaling for format-fail fallback loss")
-    p.add_argument(
-        "--grounding_mode",
-        type=str,
-        default="semantic",
-        choices=["semantic", "spatial"],
-        help="How to compute s: semantic cosine or spatial IoU.",
-    )
-    p.add_argument("--alpha_sem", type=float, default=1.0, help="Coefficient for semantic scaler s_sem")
-    p.add_argument("--alpha_iou", type=float, default=1.0, help="Coefficient for spatial scaler s_sp")
-    p.add_argument(
-        "--s_fallback_value",
-        type=float,
-        default=1.0,
-        help="Fallback s when scaler inputs are missing/invalid (unless strict mode is enabled).",
-    )
-    p.add_argument(
-        "--strict_scaler_inputs",
+        "--dump-default-config",
         action="store_true",
-        help="Raise if scaler inputs are missing/invalid instead of using s_fallback_value.",
-    )
-    p.add_argument("--ref_8bit", action="store_true", help="Load reference model in 8-bit for memory savings")
-    p.add_argument("--bf16", action="store_true", help="Use bfloat16 (recommended for Ampere+)")
-    p.add_argument("--logging_steps", type=int, default=10)
-    p.add_argument("--save_steps", type=int, default=100)
-    p.add_argument("--save_total_limit", type=int, default=2)
-    p.add_argument("--prompt_instruction", type=str, default=None, help="Instruction used as prompt when loading from CSV (default: see train/dataset_adapter.py)")
-    p.add_argument(
-        "--lora_adapter_path",
-        type=str,
-        default=None,
-        help="Optional bbox-SFT PEFT dir (e.g. .../adapter or .../adapter_latest). Policy loads base + adapter; ref is frozen base without adapter.",
-    )
-    p.add_argument(
-        "--merge_lora_adapter",
-        action="store_true",
-        help="Merge bounding-box SFT LoRA into base weights before DPO (policy is dense weights).",
+        help="Print the default YAML config (from configs/dpo.yaml) to stdout and exit.",
     )
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    if args.merge_lora_adapter and not args.lora_adapter_path:
-        raise SystemExit(
-            "--merge_lora_adapter requires --lora_adapter_path (PEFT directory, e.g. .../adapter or .../adapter_latest)."
+def _args_to_override_dict(ns: argparse.Namespace) -> dict[str, Any]:
+    skip = {"config", "dump_default_config"}
+    out: dict[str, Any] = {}
+    for k, v in vars(ns).items():
+        if k in skip:
+            continue
+        if v is not None:
+            out[k] = v
+    return out
+
+
+def _prepare_policy_and_ref(cfg: DPOTrainConfig, dtype: torch.dtype) -> tuple[Any, Any | None, Any]:
+    """
+    Returns (policy_model, ref_model, tokenizer).
+
+    Policy always uses LoRA: either continued from a merged bbox checkpoint, trainable
+    bbox PEFT, or freshly attached DPO LoRA on the base VLM. Reference is a frozen
+    copy of π_ref without the trainable DPO adapter (separate load when needed).
+    """
+    tokenizer: Any
+
+    if cfg.lora_adapter_path:
+        loaded = load_vlm_with_optional_lora(
+            cfg.model_name,
+            dtype=dtype,
+            lora_adapter_path=cfg.lora_adapter_path,
+            merge_adapter=cfg.merge_lora_adapter,
+            is_trainable=True,
         )
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        tokenizer = loaded.tokenizer
+        inner = loaded.model
 
-    dtype = torch.bfloat16 if args.bf16 else torch.float32
-    loaded = load_vlm_with_optional_lora(
-        args.model_name,
-        dtype=dtype,
-        lora_adapter_path=args.lora_adapter_path,
-        merge_adapter=args.merge_lora_adapter,
-        is_trainable=True,
-    )
-    model = loaded.model
-    tokenizer = loaded.tokenizer
+        if isinstance(inner, PeftModel) and not cfg.merge_lora_adapter:
+            ref_kw: dict[str, Any] = {"dtype": dtype}
+            if cfg.ref_8bit:
+                ref_kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            ref_loaded = load_vlm(cfg.model_name, **ref_kw)
+            ref_model = ref_loaded.model
+            for p in ref_model.parameters():
+                p.requires_grad = False
+            return inner, ref_model, tokenizer
 
-    ref_model = None
-    if args.lora_adapter_path and not args.merge_lora_adapter:
-        ref_kw: dict = {"dtype": dtype}
-        if args.ref_8bit:
-            ref_kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-        ref_loaded = load_vlm(args.model_name, **ref_kw)
-        ref_model = ref_loaded.model
-        for p in ref_model.parameters():
+        for p in inner.parameters():
             p.requires_grad = False
-    elif args.ref_8bit:
+        lcfg = default_lora_config(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
+        policy = attach_lora(inner, lora_config=lcfg, freeze_vision=True, prepare_kbit=cfg.ref_8bit)
+        return policy, inner, tokenizer
+
+    if cfg.ref_8bit:
+        policy_loaded = load_vlm(cfg.model_name, dtype=dtype)
         ref_loaded = load_vlm(
-            args.model_name,
+            cfg.model_name,
             dtype=dtype,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
         )
         ref_model = ref_loaded.model
-    # If ref_model is None, DPOTrainer creates a copy of the policy as ref (no separate frozen base).
+        for p in ref_model.parameters():
+            p.requires_grad = False
+        tokenizer = policy_loaded.tokenizer
+        lcfg = default_lora_config(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
+        policy = attach_lora(
+            policy_loaded.model,
+            lora_config=lcfg,
+            freeze_vision=True,
+            prepare_kbit=False,
+        )
+        return policy, ref_model, tokenizer
+
+    loaded = load_vlm(cfg.model_name, dtype=dtype)
+    ref_model = loaded.model
+    for p in ref_model.parameters():
+        p.requires_grad = False
+    tokenizer = loaded.tokenizer
+    lcfg = default_lora_config(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
+    policy = attach_lora(loaded.model, lora_config=lcfg, freeze_vision=True, prepare_kbit=False)
+    return policy, ref_model, tokenizer
+
+
+def main() -> None:
+    args = parse_args()
+    if args.dump_default_config:
+        cfg0 = load_dpo_train_config(default_dpo_config_path())
+        print(dump_dpo_train_config_yaml(cfg0), end="")
+        return
+
+    cfg_path = args.config or str(default_dpo_config_path())
+    base_cfg = load_dpo_train_config(cfg_path)
+    cfg = merge_dpo_train_config(base_cfg, _args_to_override_dict(args))
+
+    if cfg.merge_lora_adapter and not cfg.lora_adapter_path:
+        raise SystemExit("--merge-lora-adapter requires --lora-adapter-path in YAML or CLI.")
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+
+    dtype = torch.bfloat16 if cfg.bf16 else torch.float32
+    model, ref_model, tokenizer = _prepare_policy_and_ref(cfg, dtype)
 
     train_dataset = load_dpo_dataset(
-        args.data_path,
-        prompt_instruction=args.prompt_instruction or DEFAULT_PROMPT_INSTRUCTION,
+        cfg.data_path,
+        prompt_instruction=cfg.prompt_instruction or DEFAULT_PROMPT_INSTRUCTION,
     )
 
     training_args = DPOConfig(
-        output_dir=args.output_dir,
-        num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        max_length=args.max_length,
-        max_prompt_length=args.max_prompt_length,
-        beta=args.beta,
-        bf16=args.bf16,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
+        output_dir=cfg.output_dir,
+        num_train_epochs=cfg.num_train_epochs,
+        per_device_train_batch_size=cfg.per_device_train_batch_size,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        learning_rate=cfg.learning_rate,
+        max_length=cfg.max_length,
+        max_prompt_length=cfg.max_prompt_length,
+        beta=cfg.beta,
+        bf16=cfg.bf16,
+        logging_steps=cfg.logging_steps,
+        save_steps=cfg.save_steps,
+        save_total_limit=cfg.save_total_limit,
     )
 
     trainer = VGSPVTrainer(
@@ -145,17 +210,19 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
-        alpha_vdpo=args.alpha_vdpo,
-        vdpo_margin_m=args.vdpo_margin_m,
-        alpha_format=args.alpha_format,
-        grounding_mode=args.grounding_mode,
-        alpha_sem=args.alpha_sem,
-        alpha_iou=args.alpha_iou,
-        s_fallback_value=args.s_fallback_value,
-        strict_scaler_inputs=args.strict_scaler_inputs,
+        use_vgfdpo=cfg.use_vgfdpo,
+        use_vdpo=cfg.use_vdpo,
+        alpha_vdpo=cfg.alpha_vdpo,
+        vdpo_margin_m=cfg.vdpo_margin_m,
+        alpha_format=cfg.alpha_format,
+        grounding_mode=cfg.grounding_mode,
+        alpha_sem=cfg.alpha_sem,
+        alpha_iou=cfg.alpha_iou,
+        s_fallback_value=cfg.s_fallback_value,
+        strict_scaler_inputs=cfg.strict_scaler_inputs,
     )
     trainer.train()
-    trainer.save_model(args.output_dir)
+    trainer.save_model(cfg.output_dir)
 
 
 if __name__ == "__main__":

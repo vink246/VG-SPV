@@ -45,6 +45,8 @@ class _ToyModel(nn.Module):
 def _build_trainer(mode: str = "semantic") -> VGSPVTrainer:
     t = VGSPVTrainer.__new__(VGSPVTrainer)
     t.tokenizer = _DummyTokenizer()
+    t.use_vgfdpo = True
+    t.use_vdpo = True
     t.alpha_vdpo = 0.2
     t.vdpo_margin_m = 0.1
     t.alpha_format = 12.0
@@ -151,6 +153,41 @@ class TestVGFDPOLoss(unittest.TestCase):
         self.assertIn("metrics", outputs)
         self.assertIn("loss_total", outputs["metrics"])
         self.assertIn("loss_vdpo", outputs["metrics"])
+
+    def test_standard_dpo_when_vgfdpo_disabled(self):
+        t = _build_trainer(mode="semantic")
+        t.use_vgfdpo = False
+        t.use_vdpo = False
+        model = _ToyModel()
+
+        chosen = "plain chosen text without xml tags"
+        rejected = "plain rejected text"
+
+        def mk_row(text: str):
+            ids = t.tokenizer.encode(text)
+            seq = [1] + ids
+            labels = [-100] + ids
+            return (
+                torch.tensor([seq], dtype=torch.long),
+                torch.tensor([[1] * len(seq)], dtype=torch.long),
+                torch.tensor([labels], dtype=torch.long),
+            )
+
+        c_inp, c_attn, c_lbl = mk_row(chosen)
+        r_inp, r_attn, r_lbl = mk_row(rejected)
+        inputs = {
+            "chosen_input_ids": c_inp,
+            "chosen_attention_mask": c_attn,
+            "chosen_labels": c_lbl,
+            "rejected_input_ids": r_inp,
+            "rejected_attention_mask": r_attn,
+            "rejected_labels": r_lbl,
+        }
+
+        loss, outputs = t.compute_loss(model, inputs, return_outputs=True)
+        self.assertTrue(torch.is_tensor(loss))
+        self.assertEqual(outputs["metrics"]["loss_vgfdpo"], 0.0)
+        self.assertEqual(outputs["metrics"]["loss_vdpo"], 0.0)
 
 
 if __name__ == "__main__":

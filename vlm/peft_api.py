@@ -27,7 +27,9 @@ def load_vlm_with_optional_lora(
     (e.g. output ``adapter/`` or periodically overwritten ``adapter_latest/``).
 
     - `merge_adapter=True` merges LoRA into base weights (single forward pass, no PEFT at runtime).
-    - For VG-fDPO training, use `merge_adapter=False` and `is_trainable=True` on the policy.
+    - For DPO after bbox SFT, use `merge_adapter=False` and `is_trainable=True` on the policy;
+      `train/run_dpo.py` then adds a separate DPO LoRA stack when the bbox weights are merged
+      into dense base weights.
     """
     if merge_adapter and not lora_adapter_path:
         raise ValueError("merge_adapter=True requires lora_adapter_path to a saved PEFT adapter directory.")

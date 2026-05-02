@@ -25,6 +25,7 @@ dependencies:
       - peft
       - trl
       - datasets
+      - pyyaml
       - qwen-vl-utils
       - gdown
       - openai>=1.40.0
