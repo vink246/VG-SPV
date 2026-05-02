@@ -1,10 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #SBATCH --job-name=vgspv-traces
 #SBATCH --output=logs/vgspv-traces-%j.out
 #SBATCH --error=logs/vgspv-traces-%j.err
-#SBATCH --time=18:00:00
+#SBATCH --time=10:00:00
 #SBATCH --gres=gpu:h200
-#SBATCH --cpus-per-task=8
+#SBATCH -c 8
 #SBATCH --mem=32G
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=psomu3@gatech.edu
@@ -40,21 +40,11 @@ set -euo pipefail
 # 1. Cluster-specific setup (EDIT IF NEEDED)
 # ----------------------------------------------------------------------------
 
-conda activate vg-spv
 
-# Always run from the repo root regardless of submit-time CWD.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_ROOT}"
-
-# OpenAI key: prefer the env var, fall back to the file, error out otherwise.
+# export OPENAI_API_KEY=""
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-    if [[ -f "${HOME}/.config/openai/api_key" ]]; then
-        OPENAI_API_KEY="$(< "${HOME}/.config/openai/api_key")"
-        export OPENAI_API_KEY
-    else
-        echo "ERROR: OPENAI_API_KEY is not set and ${HOME}/.config/openai/api_key not found." >&2
-        exit 2
-    fi
+    echo "ERROR: OPENAI_API_KEY is not set." >&2
+    exit 2
 fi
 
 # ----------------------------------------------------------------------------
@@ -62,7 +52,7 @@ fi
 # ----------------------------------------------------------------------------
 
 # MM-SafetyBench split to process: "train" or "test".
-SPLIT="test"
+SPLIT="train"
 
 # MM-SafetyBench extracted_data root. Both Method 1 and Method 2 use this.
 DATASET_DIR="data/mm-safebench_1/extracted_data"
@@ -102,6 +92,8 @@ echo "DINO_CKPT    : ${DINO_CHECKPOINT}"
 echo "GPUs visible :"
 nvidia-smi -L 2>/dev/null || echo "  (nvidia-smi not available)"
 echo "================="
+pwd
+echo "================="
 
 # ============================================================================
 # Method 1 -- GPT-5.4-mini via OpenAI Batch /v1/responses
@@ -114,7 +106,7 @@ M1_LIMIT=""    # set to e.g. M1_LIMIT="--limit 100" for smoke tests
 
 echo
 echo "==== Method 1: prepare ===="
-python -m scripts.generate_method1_traces prepare \
+conda run -n vg-spv --no-capture-output python -u -m scripts.generate_method1_traces prepare \
     --split        "${SPLIT}" \
     --dataset-dir  "${DATASET_DIR}" \
     --data-root    "${DATASET_DIR}" \
@@ -130,7 +122,7 @@ M1_RESUBMIT=""    # set to "--resubmit" to resubmit chunks already in state.json
 
 echo
 echo "==== Method 1: submit ===="
-python -m scripts.generate_method1_traces submit \
+conda run -n vg-spv --no-capture-output python -u -m scripts.generate_method1_traces submit \
     --split        "${SPLIT}" \
     --dataset-dir  "${DATASET_DIR}" \
     --data-root    "${DATASET_DIR}" \
@@ -143,7 +135,7 @@ python -m scripts.generate_method1_traces submit \
 # on the OpenAI batch queue depth at submission time.
 echo
 echo "==== Method 1: wait ===="
-python -m scripts.generate_method1_traces wait \
+conda run -n vg-spv --no-capture-output python -u -m scripts.generate_method1_traces wait \
     --split         "${SPLIT}" \
     --dataset-dir   "${DATASET_DIR}" \
     --data-root     "${DATASET_DIR}" \
@@ -155,7 +147,7 @@ python -m scripts.generate_method1_traces wait \
 # trainer-ready CSV: traces/${SPLIT}_method1.csv
 echo
 echo "==== Method 1: collect ===="
-python -m scripts.generate_method1_traces collect \
+conda run -n vg-spv --no-capture-output python -u -m scripts.generate_method1_traces collect \
     --split        "${SPLIT}" \
     --dataset-dir  "${DATASET_DIR}" \
     --data-root    "${DATASET_DIR}" \
@@ -181,12 +173,12 @@ M2_OVERWRITE=""        # set to "--overwrite" to re-process all rows
 
 echo
 echo "==== Method 2: run ===="
-python -m scripts.generate_method2_traces \
+conda run -n vg-spv --no-capture-output python -u -m scripts.generate_method2_traces \
     --split           "${SPLIT}" \
     --checkpoint      "${DINO_CHECKPOINT}" \
     --dataset-dir     "${DATASET_DIR}" \
     --device          "cuda" \
-    --box-threshold   0.4 \
+    --box-threshold   0.3 \
     --text-threshold  0.25 \
     --nms-iou         0.5 \
     --max-per-phrase  5 \
