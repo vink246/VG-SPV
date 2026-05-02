@@ -27,6 +27,7 @@ dependencies:
       - datasets
       - qwen-vl-utils
       - gdown
+      - openai>=1.40.0
       # Install after env create with --no-build-isolation (see scripts/):
       # - scripts/install_grounding_dino.sh  (Grounding DINO)
       # - scripts/install_flash_attn.sh      (optional, flash-attn)
