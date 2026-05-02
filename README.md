@@ -13,6 +13,7 @@ Built for a research project in CS 8803 (LLMs) at Georgia Tech.
 ```
 VG-SPV/
 ├── data/                          # Evaluation and training datasets (e.g. HADES, MM Safety Bench, COCO, VLGuard, VisCRA); download/process scripts; sample CSV
+│   ├── download_bounding_box_sft_datasets.py # Cache RefCOCO-style HF datasets for bbox SFT
 │   ├── sample_dpo_data.csv        # Example CSV (image, perturbed image, chosen/rejected reasoning trace)
 │   └── [dataset]                  # HuggingFace dataset/benchmark obtained by HF CLI, as seen in scripts/install_datasets.sh
 │       ├── data                   # Data content directly pulled from HuggingFace
@@ -20,24 +21,34 @@ VG-SPV/
 ├── weights/                       # Pretrained Grounding DINO checkpoints (see step 5 under Setup)
 ├── outputs/                       # Experiment outputs, visualizations, metrics, and other saved results
 ├── eval/                          # Scripts for running VisCRA ASR and RefCOCO benchmarks
+│   └── run_bounding_box_sft_eval.py  # IoU / Acc@0.5 for bbox-SFT outputs
 ├── inference/                     # Scripts to query the model (no training)
 │   ├── run_inference.py           # VL image + text inference (use --model to choose model)
 │   ├── run_grounding_dino.py      # Grounding DINO inference for box supervision / GT generation
 │   └── utils.py                   # Legacy inference helpers (prefer `vlm.run_vl_inference` + `LoadedVLM`)
-├── vlm/                           # VLM backends (Qwen-VL, LLaVA, TinyLLaVA): load_vlm, run_vl_inference, LoadedVLM
+├── vlm/                           # VLM backends (Qwen-VL, LLaVA, TinyLLaVA, Mllama): load_vlm, run_vl_inference, LoadedVLM
+│   └── peft_api.py                # load_vlm_with_optional_lora (bbox SFT adapter for inference / DPO)
 ├── models/                        # VG-PRM reward logic and TinyLLaVA model wrappers
 │   └── reward_dino.py             # Grounding DINO IoU-based reward computation
 ├── scripts/                       # Bash scripts for launching training/eval runs
 │   ├── generate_traces.py         # GPT-4o API script for synthesizing data
 │   ├── process_hf_data.py         # Extract and organize HuggingFace dataset/benchmark data
 │   ├── install_datasets.sh        # Execute HuggingFace data download and reorganization
+│   ├── run_bounding_box_sft.sh    # Launch bounding-box SFT (LoRA)
 │   ├── run_dpo_train.sh           # Launch DPO training
 │   ├── install_grounding_dino.sh  # Install Grounding DINO after env create
 │   └── install_flash_attn.sh      # Install flash-attn after env create (optional)
 ├── train/                         # DPO pipeline (TRL DPOTrainer) and VG-fDPO loss stub
 │   ├── dpo_trainer.py             # VGSPVTrainer (override compute_loss for VG-fDPO)
 │   ├── dataset_adapter.py         # DPO dataset contract and CSV loader (image, perturbed_image, chosen/rejected reasoning traces)
-│   └── run_dpo.py                 # DPO training entrypoint
+│   ├── lora_factory.py            # Attach PEFT LoRA + freeze vision (bbox SFT / reuse)
+│   ├── run_dpo.py                 # DPO training entrypoint (optional `--lora_adapter_path`)
+│   ├── run_bounding_box_sft.py    # LoRA SFT: referring expression → XML + normalized boxes
+│   ├── bounding_box_sft_collator.py   # Multimodal batching + label masking
+│   ├── bounding_box_sft_dataset.py    # HF RefCOCO-style rows → chat messages
+│   ├── bounding_box_sft_schema.py     # `<risk_factors_with_boxes>` prompt/answer templates
+│   ├── bounding_box_sft_torch_dataset.py  # Index dataset for HF Trainer
+│   └── tag_parsing.py             # Parse boxes from model text (eval / rewards)
 ├── utils.py                       # Re-exports vlm + build_messages (chat JSON format)
 ├── environment.yml                # Dependencies (torch, transformers, groundingdino, etc.)
 ├── README.md                      # This file
@@ -102,7 +113,7 @@ The `environment.yml` includes:
 
 - **Python 3.10**, PyTorch (CUDA 12.1), torchvision, torchaudio  
 - **Transformers**, Accelerate, PEFT, TRL, Datasets  
-- **VL models**: Inference and training are model-agnostic. Supported families include **Qwen3-VL** (e.g. 2B, 4B, 8B), **LLaVA**, and **TinyLLaVA**; add more in [`vlm/backends/`](vlm/backends/) and [`vlm/registry.py`](vlm/registry.py) (pattern → family → backend).  
+- **VL models**: Inference and training are model-agnostic. Supported families include **Qwen3-VL** (e.g. 2B, 4B, 8B), **LLaVA**, **Llama 3.2 Vision (Mllama)**, and **TinyLLaVA**; add more in [`vlm/backends/`](vlm/backends/) and [`vlm/registry.py`](vlm/registry.py) (pattern → family → backend).  
 - **Grounding DINO** (from source) for spatial reward computation — install after env create: `bash scripts/install_grounding_dino.sh`.  
 - **Flash Attention** (optional, for Qwen-VL memory efficiency) — install after env create: `bash scripts/install_flash_attn.sh`.  
 
@@ -179,9 +190,118 @@ Training data is stored as **CSV** files with the following columns (headers may
 
 ---
 
+## Bounding-box SFT (LoRA): phrases → XML + boxes
+
+**Bounding-box supervised finetuning (SFT)** is a **separate** step from VG-fDPO. It teaches supported VLMs (HF **LLaVA** and **Llama 3.2 Vision / Mllama** backends) to emit axis-aligned boxes inside the `<risk_factors_with_boxes>` segment, followed by `<logic>` and `<response>` (see `train/bounding_box_sft_schema.py`). Corners are written as **integers on a 0–1000 grid** (Shikra-style) so tokenizers do not split decimals awkwardly; `train/tag_parsing.py` accepts both that format and legacy float tuples for eval and older traces.
+
+**Recommended models (paper baselines):**
+
+- LLaVA-v1.6-Mistral-7B class: e.g. `llava-hf/llava-1.6-mistral-7b-hf` (verify the exact Hub id for your checkpoint).
+- Llama-3.2-11B-Vision-Instruct: `meta-llama/Llama-3.2-11B-Vision-Instruct` (gated; set a Hugging Face token with access).
+
+**Datasets (Shikra / VoCoT-style REC):**
+
+- **Training (default):** [`PaDT-MLLM/RefCOCO`](https://huggingface.co/datasets/PaDT-MLLM/RefCOCO) — preprocessed RefCOCO with a `train` split (VoCoT / PaDT line of work; large referring-expression corpus).
+- **Evaluation (default):** [`lmms-lab/RefCOCO`](https://huggingface.co/datasets/lmms-lab/RefCOCO) — `val` split (lmms-eval style; no `train` on this hub).
+- **More REC data:** Shikra and VoCoT also leverage **RefCOCO+** and **RefCOCOg**; PaDT hosts companion hubs under the [`PaDT-MLLM` organization](https://huggingface.co/PaDT-MLLM). The downloader preset `eval_rec` touches `lmms-lab/RefCOCO`, `lmms-lab/RefCOCOplus`, and `lmms-lab/RefCOCOg` validation splits.
+
+**1) Cache datasets (downloads into the HF datasets cache):**
+
+```bash
+python data/download_bounding_box_sft_datasets.py --preset train_rec
+python data/download_bounding_box_sft_datasets.py --preset eval_rec
+# Or a single hub + split:
+python data/download_bounding_box_sft_datasets.py --dataset_id PaDT-MLLM/RefCOCO --split train
+```
+
+**2) Run LoRA SFT:**
+
+```bash
+# Linux / macOS — optional env vars; extra CLI args are forwarded (see scripts/run_bounding_box_sft.sh)
+MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct OUTPUT_DIR=outputs/bbox_sft_llama bash scripts/run_bounding_box_sft.sh
+# e.g. pass HF dataset overrides or CSV mix:
+# MODEL_NAME=... bash scripts/run_bounding_box_sft.sh --dataset_config refcoco --vgspv_csv data/your.csv --vgspv_mix_fraction 0.15
+
+# Or invoke Python directly (Windows-friendly)
+python train/run_bounding_box_sft.py ^
+  --model_name llava-hf/llava-1.6-mistral-7b-hf ^
+  --dataset_id PaDT-MLLM/RefCOCO --split train ^
+  --output_dir outputs/bbox_sft_llava --bf16 --gradient_checkpointing
+
+# Optional: mix VG-fDPO CSV rows (same schema as DPO: image + chosen_reasoning_trace) for safety-style supervision
+python train/run_bounding_box_sft.py --model_name meta-llama/Llama-3.2-11B-Vision-Instruct ^
+  --vgspv_csv data/sample_dpo_data.csv --vgspv_mix_fraction 0.2 --save_every_steps 200
+
+# Resume LoRA training from a saved adapter (base must match --model_name)
+python train/run_bounding_box_sft.py --model_name llava-hf/llava-1.6-mistral-7b-hf ^
+  --resume_adapter_path outputs/bbox_sft_llava/adapter_latest --output_dir outputs/bbox_sft_llava_cont
+```
+
+Full flag reference (`python train/run_bounding_box_sft.py --help` is authoritative):
+
+| Area | Flags |
+|------|--------|
+| Model | **`--model_name`** (required), **`--model_family`** (`qwen3_vl`, `llava`, `mllama`, `tinyllava` — bbox SFT collator rejects TinyLLaVA today), **`--bf16`**, **`--gradient_checkpointing`** |
+| HF REC data | **`--dataset_id`**, **`--dataset_config`**, **`--split`**, **`--max_samples`** (cap rows for debugging) |
+| VG-SPV CSV mix | **`--vgspv_csv`**, **`--vgspv_mix_fraction`** (must be positive when CSV is set), **`--vgspv_prompt_instruction`**, **`--mix_seed`** (deterministic HF vs CSV per index). CSV **`image`** paths must be absolute or relative to the **working directory** when you launch training. |
+| Resume | **`--resume_adapter_path`** — PEFT dir (`adapter/` or `adapter_latest/`); skips fresh LoRA init |
+| Checkpoints | **`--save_every_steps`** (default 500; **`0`** = no step checkpoints), **`--save_every_n_epochs`** (0 = off), **`--save_total_limit`** (rolling HF checkpoints under `output_dir`) — each step/epoch save also refreshes **`adapter_latest/`** |
+| Training | **`--epochs`**, **`--learning_rate`**, **`--per_device_train_batch_size`**, **`--gradient_accumulation_steps`**, **`--logging_steps`**, **`--warmup_ratio`**, **`--max_steps`** (positive value caps training by global steps instead of epochs) |
+| LoRA (ignored if **`--resume_adapter_path`**; adapter on disk defines architecture when resuming) | **`--lora_r`**, **`--lora_alpha`**, **`--lora_dropout`** |
+| Output | **`--output_dir`** |
+
+**Note:** Synthesized boxes in `train/bounding_box_sft_schema.py` use **four-digit** zero-padding (0–1000 inclusive per corner) so `1000` tokenizes cleanly; eval accepts integer grid and legacy float quads.
+
+Artifacts:
+
+- **`outputs/.../adapter/`** — final PEFT adapter + tokenizer/processor (pass to `inference/run_inference.py --lora-adapter` or `train/run_dpo.py --lora_adapter_path`).
+- **`outputs/.../adapter_latest/`** — last successful periodic save (overwritten each time).
+- **`outputs/.../bounding_box_sft_meta.json`** — base model id, dataset id, mix/resume/save settings, LoRA hyperparameters.
+
+**3) Evaluate IoU on a RefCOCO split:**
+
+Use **`--lora_adapter`** pointing at **`adapter/`** (final) or **`adapter_latest/`** (last periodic save).
+
+```bash
+python eval/run_bounding_box_sft_eval.py ^
+  --model_name llava-hf/llava-1.6-mistral-7b-hf ^
+  --lora_adapter outputs/bbox_sft_llava/adapter ^
+  --dataset_id lmms-lab/RefCOCO --split val --max_samples 500 --bf16
+```
+
+The script reports **`mean_iou_mean_max_per_gt`** (average over GT boxes of the best IoU to any predicted box, so extra predictions or multiple instances do not collapse to “first box only”), **`acc_mean_max_iou_0.5`**, and **`acc_all_gt_boxes_iou_0.5`** (every GT has some prediction with IoU ≥ 0.5). Parsing: integer grid or legacy decimals (`train/tag_parsing.py`).
+
+**4) Inference with the adapter:**
+
+`--lora-adapter` accepts the same PEFT directory as training: **`adapter/`** or **`adapter_latest/`**.
+
+```bash
+python inference/run_inference.py --model meta-llama/Llama-3.2-11B-Vision-Instruct ^
+  --lora-adapter outputs/bbox_sft_llama/adapter --image path/to/img.jpg --prompt "Your task prompt here"
+```
+
+Use `--merge-lora-adapter` to fuse LoRA into dense weights before generation (optional deployment path).
+
+**5) VG-fDPO (after bbox SFT) with the same adapter:**
+
+```bash
+python train/run_dpo.py --model_name llava-hf/llava-1.6-mistral-7b-hf ^
+  --lora_adapter_path outputs/bbox_sft_llava/adapter --data_path data/sample_dpo_data.csv --bf16
+```
+
+When `--lora_adapter_path` is set, **the reference model is an explicit frozen copy of the base VLM** (without LoRA), which is the standard DPO+LoRA pattern. Pass `--merge_lora_adapter` only if you have merged weights and point `--model_name` at that merged checkpoint instead.
+
+**Implementation notes**
+
+- **TinyLLaVA** is not supported by the bounding-box SFT collator yet (no shared HF `processor.apply_chat_template` path); extend `train/bounding_box_sft_collator.py` if you need it.
+- Bounding boxes in rows are assumed to be **COCO xywh in pixels** unless all four numbers already lie in `[0,1]` as **xyxy** (see `train/bounding_box_sft_dataset.py`). For **multiple instances**, supply a list of boxes in **`bbox`** (list-of-lists) or use columns **`bboxes`**, **`boxes`**, **`gt_boxes`**, or **`bbox_list`**; training emits one `phrase: ... | box: ...` line per box.
+- LoRA targets default to Mistral/Llama linear projections (`train/lora_factory.py`); widen if your checkpoint uses different submodule names.
+
+---
+
 ## Usage (high level)
 
-1. **Inference**: Run `inference/run_inference.py` with `--model` to query any supported VL model (e.g. TinyLLaVA, LLaVA). Example: `python inference/run_inference.py --model tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B --image path/to/img.png --prompt "Describe this image"`. If you see **"Disk quota exceeded"**, the Hugging Face model cache is on a full filesystem: set the cache to a directory with space (e.g. scratch) with `export HF_HOME=~/scratch/.cache/huggingface` before running, or use `--cache_dir ~/scratch/.cache/huggingface/hub`. The script also auto-uses `$SCRATCH` for the cache when set.
+1. **Inference**: Run `inference/run_inference.py` with `--model` to query any supported VL model (e.g. TinyLLaVA, LLaVA). Add `--lora-adapter path/to/adapter` after bounding-box SFT. Example: `python inference/run_inference.py --model tinyllava/TinyLLaVA-Phi-2-SigLIP-3.1B --image path/to/img.png --prompt "Describe this image"`. If you see **"Disk quota exceeded"**, the Hugging Face model cache is on a full filesystem: set the cache to a directory with space (e.g. scratch) with `export HF_HOME=~/scratch/.cache/huggingface` before running, or use `--cache_dir ~/scratch/.cache/huggingface/hub`. The script also auto-uses `$SCRATCH` for the cache when set.
 2. **Data**: Run `./scripts/install_datasets.sh` then `scripts/generate_traces.py` to download/process datasets and synthesize traces. Output should match the [dataset format](#dataset-format) (CSV: image, perturbed image, chosen reasoning trace, rejected reasoning trace).
 3. **Training**: Use scripts in `scripts/` to launch VG-fDPO training (e.g. `bash scripts/run_dpo_train.sh`). Use `--model_name` to pick any supported VL model. The `train/` directory contains the DPO pipeline (TRL DPOTrainer) with a custom trainer stub for VG-fDPO loss.
 4. **Reward**: `models/reward_dino.py` provides the Grounding DINO IoU-based reward for VG-PRM. For ground-truth box generation, run `inference/run_grounding_dino.py` with `--checkpoint` (config is auto-selected from the checkpoint name).

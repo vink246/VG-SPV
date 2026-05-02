@@ -19,7 +19,7 @@ from trl import DPOConfig
 
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION, load_dpo_dataset
 from train.dpo_trainer import VGSPVTrainer
-from vlm import load_vlm
+from vlm import load_vlm, load_vlm_with_optional_lora
 
 
 def parse_args():
@@ -39,33 +39,85 @@ def parse_args():
     p.add_argument("--max_length", type=int, default=512)
     p.add_argument("--max_prompt_length", type=int, default=256)
     p.add_argument("--beta", type=float, default=0.1, help="DPO temperature")
+    p.add_argument("--alpha_vdpo", type=float, default=0.1, help="Weight for V-DPO term in total loss")
+    p.add_argument("--vdpo_margin_m", type=float, default=0.0, help="Margin m for V-DPO hinge")
+    p.add_argument("--alpha_format", type=float, default=12.0, help="Scaling for format-fail fallback loss")
+    p.add_argument(
+        "--grounding_mode",
+        type=str,
+        default="semantic",
+        choices=["semantic", "spatial"],
+        help="How to compute s: semantic cosine or spatial IoU.",
+    )
+    p.add_argument("--alpha_sem", type=float, default=1.0, help="Coefficient for semantic scaler s_sem")
+    p.add_argument("--alpha_iou", type=float, default=1.0, help="Coefficient for spatial scaler s_sp")
+    p.add_argument(
+        "--s_fallback_value",
+        type=float,
+        default=1.0,
+        help="Fallback s when scaler inputs are missing/invalid (unless strict mode is enabled).",
+    )
+    p.add_argument(
+        "--strict_scaler_inputs",
+        action="store_true",
+        help="Raise if scaler inputs are missing/invalid instead of using s_fallback_value.",
+    )
     p.add_argument("--ref_8bit", action="store_true", help="Load reference model in 8-bit for memory savings")
     p.add_argument("--bf16", action="store_true", help="Use bfloat16 (recommended for Ampere+)")
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=100)
     p.add_argument("--save_total_limit", type=int, default=2)
     p.add_argument("--prompt_instruction", type=str, default=None, help="Instruction used as prompt when loading from CSV (default: see train/dataset_adapter.py)")
+    p.add_argument(
+        "--lora_adapter_path",
+        type=str,
+        default=None,
+        help="Optional bbox-SFT PEFT dir (e.g. .../adapter or .../adapter_latest). Policy loads base + adapter; ref is frozen base without adapter.",
+    )
+    p.add_argument(
+        "--merge_lora_adapter",
+        action="store_true",
+        help="Merge bounding-box SFT LoRA into base weights before DPO (policy is dense weights).",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.merge_lora_adapter and not args.lora_adapter_path:
+        raise SystemExit(
+            "--merge_lora_adapter requires --lora_adapter_path (PEFT directory, e.g. .../adapter or .../adapter_latest)."
+        )
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     dtype = torch.bfloat16 if args.bf16 else torch.float32
-    loaded = load_vlm(args.model_name, dtype=dtype)
+    loaded = load_vlm_with_optional_lora(
+        args.model_name,
+        dtype=dtype,
+        lora_adapter_path=args.lora_adapter_path,
+        merge_adapter=args.merge_lora_adapter,
+        is_trainable=True,
+    )
     model = loaded.model
     tokenizer = loaded.tokenizer
 
     ref_model = None
-    if args.ref_8bit:
+    if args.lora_adapter_path and not args.merge_lora_adapter:
+        ref_kw: dict = {"dtype": dtype}
+        if args.ref_8bit:
+            ref_kw["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        ref_loaded = load_vlm(args.model_name, **ref_kw)
+        ref_model = ref_loaded.model
+        for p in ref_model.parameters():
+            p.requires_grad = False
+    elif args.ref_8bit:
         ref_loaded = load_vlm(
             args.model_name,
             dtype=dtype,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
         )
         ref_model = ref_loaded.model
-    # If ref_model is None, DPOTrainer creates a copy of the model as ref
+    # If ref_model is None, DPOTrainer creates a copy of the policy as ref (no separate frozen base).
 
     train_dataset = load_dpo_dataset(
         args.data_path,
@@ -93,6 +145,14 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
+        alpha_vdpo=args.alpha_vdpo,
+        vdpo_margin_m=args.vdpo_margin_m,
+        alpha_format=args.alpha_format,
+        grounding_mode=args.grounding_mode,
+        alpha_sem=args.alpha_sem,
+        alpha_iou=args.alpha_iou,
+        s_fallback_value=args.s_fallback_value,
+        strict_scaler_inputs=args.strict_scaler_inputs,
     )
     trainer.train()
     trainer.save_model(args.output_dir)

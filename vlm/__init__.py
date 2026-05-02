@@ -1,13 +1,15 @@
-"""VLM backends: load and infer across Qwen-VL, LLaVA, TinyLLaVA."""
+"""VLM backends: load and infer across Qwen-VL, LLaVA, Llama / Mllama vision, TinyLLaVA."""
 
 from vlm.api import load_vlm, load_vl_model_and_processor, parse_dtype
 from vlm.inference import run_vl_inference, run_vl_inference_legacy
+from vlm.peft_api import load_vlm_with_optional_lora
 from vlm.registry import get_model_family
 from vlm.schema import LoadedVLM
 
 __all__ = [
     "LoadedVLM",
     "load_vlm",
+    "load_vlm_with_optional_lora",
     "load_vl_model_and_processor",
     "parse_dtype",
     "get_model_family",
