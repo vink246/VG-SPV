@@ -2,7 +2,9 @@
 VG-SPV DPO Trainer implementing:
   - VG-fDPO masked loss (M_G / M_L / M_total) + format-fail fallback when ``use_vgfdpo=True`` (default)
   - Standard full-sequence DPO when ``use_vgfdpo=False``
-  - V-DPO contrastive term when ``use_vdpo=True`` (default; paper Eq. 7)
+  - V-DPO contrastive term when ``use_vdpo=True`` (opt-in; off by default; paper Eq. 7).
+    Enabling V-DPO requires the dataset to carry ``chosen_perturbed_*`` columns and
+    triggers an extra forward pass per step through the perturbed image.
 """
 
 from __future__ import annotations
@@ -73,7 +75,7 @@ class VGSPVTrainer(DPOTrainer):
         self,
         *args: Any,
         use_vgfdpo: bool = True,
-        use_vdpo: bool = True,
+        use_vdpo: bool = False,
         alpha_vdpo: float = 0.1,
         vdpo_margin_m: float = 0.0,
         alpha_format: float = 13.0,

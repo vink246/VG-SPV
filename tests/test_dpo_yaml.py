@@ -15,14 +15,18 @@ class TestDPOYaml(unittest.TestCase):
         cfg = load_dpo_train_config(p)
         self.assertIsInstance(cfg, DPOTrainConfig)
         self.assertTrue(cfg.use_vgfdpo)
-        self.assertTrue(cfg.use_vdpo)
+        # V-DPO is opt-in (off by default); enabling it requires perturbed-image
+        # data and ~doubles per-step forward FLOPs, so default L_total = L_VG-fDPO only.
+        self.assertFalse(cfg.use_vdpo)
         self.assertEqual(cfg.grounding_mode, "semantic")
         self.assertAlmostEqual(cfg.alpha_format, 13.0)
         self.assertAlmostEqual(cfg.beta, 0.1)
 
     def test_merge_overrides(self):
         base = load_dpo_train_config(default_dpo_config_path())
-        merged = merge_dpo_train_config(base, {"use_vgfdpo": False, "learning_rate": 1e-6})
+        merged = merge_dpo_train_config(
+            base, {"use_vgfdpo": False, "use_vdpo": True, "learning_rate": 1e-6}
+        )
         self.assertFalse(merged.use_vgfdpo)
         self.assertTrue(merged.use_vdpo)
         self.assertEqual(merged.learning_rate, 1e-6)

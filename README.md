@@ -289,7 +289,7 @@ python train/run_dpo.py --model_name llava-hf/llava-1.6-mistral-7b-hf ^
   --lora_adapter_path outputs/bbox_sft_llava/adapter --data_path data/sample_dpo_data.csv --bf16
 ```
 
-When `--lora_adapter_path` is set, **the reference model is an explicit frozen copy of the base VLM** (without LoRA), which is the standard DPO+LoRA pattern. Pass `--merge_lora_adapter` only if you have merged weights and point `--model_name` at that merged checkpoint instead.
+When `--lora_adapter_path` is set, **the reference model is an explicit frozen copy of the base VLM** (without LoRA), which is the standard DPO+LoRA pattern. Pass `--merge_lora_adapter` only if you have merged weights and point `--model_name` at that merged checkpoint instead. By default **`configs/dpo.yaml` trains the policy with LoRA** (`train/run_dpo.py` attaches PEFT), and **V-DPO (`use_vdpo`) is off** unless you enable it in YAML or via CLI.
 
 **Implementation notes**
 

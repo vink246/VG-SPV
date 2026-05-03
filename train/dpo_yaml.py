@@ -36,7 +36,7 @@ class DPOTrainConfig:
     save_total_limit: int = 3
 
     use_vgfdpo: bool = True
-    use_vdpo: bool = True
+    use_vdpo: bool = False
     alpha_vdpo: float = 0.1
     vdpo_margin_m: float = 0.0
     alpha_format: float = 13.0

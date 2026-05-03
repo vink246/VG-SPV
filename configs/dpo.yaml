@@ -1,5 +1,7 @@
 # VG-SPV DPO / VG-fDPO / V-DPO training (see iclr2026_conference.tex, Approach).
-# Defaults: Method 1 semantic scaler (s_sem), joint L_total = L_VG-fDPO + alpha * L_V-DPO.
+# Defaults: Method 1 semantic scaler (s_sem), L_total = L_VG-fDPO (V-DPO is opt-in).
+# Set use_vdpo: true to add the paper's Eq. (7) contrastive term (requires
+# chosen_perturbed_* columns in the dataset and one extra forward pass per step).
 # Override any key via CLI: python train/run_dpo.py --learning-rate 1e-5
 
 model_name: llava-hf/llava-v1.6-mistral-7b-hf
@@ -22,8 +24,10 @@ save_total_limit: 3
 
 # L_VG-fDPO (segment-masked preference); set false for plain full-sequence DPO
 use_vgfdpo: true
-# L_V-DPO contrastive term; paper Eq. (7) with coefficient alpha_vdpo
-use_vdpo: true
+# L_V-DPO contrastive term; paper Eq. (7) with coefficient alpha_vdpo.
+# OFF by default -- enabling this requires chosen_perturbed_* columns in the
+# dataset and roughly doubles the per-step forward FLOPs for the policy.
+use_vdpo: false
 alpha_vdpo: 0.1
 vdpo_margin_m: 0.0
 # Paper: alpha_format between 12 and 15 for format-fail fallback (Eq. 5)

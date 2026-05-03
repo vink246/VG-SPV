@@ -65,8 +65,13 @@ def parse_args() -> argparse.Namespace:
     add("logging_steps", int, "")
     add("save_steps", int, "")
     add("save_total_limit", int, "")
-    add("use_vgfdpo", _str2bool, "Segment-masked VG-fDPO loss (paper L_VG-fDPO)")
-    add("use_vdpo", _str2bool, "V-DPO contrastive term (paper L_V-DPO)")
+    add("use_vgfdpo", _str2bool, "Segment-masked VG-fDPO loss (paper L_VG-fDPO); on by default")
+    add(
+        "use_vdpo",
+        _str2bool,
+        "V-DPO contrastive term (paper L_V-DPO); OFF by default. Enabling requires "
+        "chosen_perturbed_* dataset columns and ~doubles per-step forward FLOPs.",
+    )
     add("alpha_vdpo", float, "Weight alpha on V-DPO term (paper Eq. 7)")
     add("vdpo_margin_m", float, "V-DPO hinge margin m")
     add("alpha_format", float, "Format-fail scaler (paper Eq. 5; typically 12–15)")
