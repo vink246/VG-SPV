@@ -1,8 +1,9 @@
 """
 Build ``rejected_reasoning_trace`` XML from an accepted (chosen) VG-SPV trace.
 
-Implements three conditional paths (abliterated prompts for A/B; hardcoded C) plus
-Method-2-only bounding-box perturbation (wrong boxes, chosen ``<logic>`` / ``<response>`` verbatim).
+Implements three conditional paths (abliterated prompts for A/B; hardcoded C), Method-2-only
+bounding-box perturbation, **risk-only** confusable-token edits, and **format_break** malformed
+XML negatives (chosen ``<logic>`` / ``<response>`` inners reused where applicable).
 """
 
 from __future__ import annotations
@@ -378,6 +379,248 @@ def perturb_method2_risk_boxes_inner(
         new_box = format_norm_box(*new_norm)
         lines_out.append(f'phrase: "{phrase}" | box: {new_box}')
     return "\n".join(lines_out)
+
+
+# --- Wrong risk tokens (no LM): semantic / spatial inner text only ---
+
+# Map substrings (lowercase) -> plausible *wrong-but-similar* substitutes for DPO negatives.
+_CONFUSABLE_ALTERNATIVES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("firearm", ("toy gun", "airsoft replica", "prop firearm", "plastic replica gun")),
+    ("gun", ("toy gun", "nail gun", "grease gun", "hot glue gun")),
+    ("knife", ("butter knife", "plastic knife", "letter opener", "kitchen spatula")),
+    ("blade", ("plastic blade", "paper edge", "metal ruler")),
+    ("pill", ("vitamins", "candy pieces", "mint tablets", "confetti")),
+    ("pills", ("vitamins", "supplements", "candy", "placebo tablets")),
+    ("powder", ("flour dust", "talc powder", "chalk dust")),
+    ("blood", ("red paint", "ketchup stain", "movie prop blood")),
+    ("explosive", ("fireworks packaging", "model rocket", "pressurized can")),
+    ("weapon", ("toy weapon", "costume prop", "museum replica")),
+    ("bomb", ("clock art project", "circuit breadboard", "movie prop")),
+    ("drug", ("salt shaker", "spice jar", "baking soda box")),
+    ("alcohol", ("hand sanitizer", "cleaning fluid bottle", "soda bottle")),
+    ("money", ("monopoly money", "movie prop cash", "receipts stack")),
+    ("chain", ("plastic chain", "jewelry chain", "bike chain")),
+    ("rope", ("clothesline", "decorative cord", "jump rope")),
+    ("syringe", ("pen body", "marker cap", "pipette toy")),
+    ("cigarette", ("chalk stick", "pencil stub", "twig")),
+    ("cannabis", ("fern leaves", "parsley bunch", "plastic plant")),
+)
+
+_FALSE_POSITIVE_WHEN_NO_RISK = (
+    "shadow, glare, ambiguous dark shape",
+    "reflection, blur, JPEG compression artifact",
+    "printed text, sticker graphic, packaging label",
+    "plastic toy, harmless prop, costume accessory",
+)
+
+
+def _plausible_wrong_factor(original: str, rng: random.Random) -> str:
+    """Turn one gold risk token into a *plausible misread* (similar surface, wrong semantics)."""
+    o = original.strip()
+    if not o:
+        return "unidentified object"
+    low = o.lower()
+    for needle, alts in _CONFUSABLE_ALTERNATIVES:
+        if needle in low:
+            return rng.choice(alts)
+    templates = (
+        f"plastic toy {o}",
+        f"toy {o}",
+        f"{o} replica",
+        f"blurry {o}-like shape",
+        f"lookalike {o} prop",
+        f"staged {o} (likely benign)",
+    )
+    return rng.choice(templates)
+
+
+def _similar_wrong_semantic_csv(factors: list[str], rng: random.Random) -> str:
+    """Comma-separated wrong factors loosely anchored to the chosen list."""
+    parts = [_plausible_wrong_factor(f, rng) for f in factors if f.strip()]
+    if not parts:
+        parts = ["ambiguous prop", "background clutter"]
+    if len(parts) > 1 and rng.random() < 0.35:
+        del parts[rng.randrange(len(parts))]
+    if rng.random() < 0.28:
+        parts.append(rng.choice(("packaging", "shadow", "reflection", "motion blur")))
+    return ", ".join(parts)
+
+
+def _replace_semantic_risk_block(whole: str, new_block: str) -> str | None:
+    replaced, n = _RISK_SEMANTIC_BLOCK_RE.subn(new_block, whole, count=1)
+    return replaced.strip() if n == 1 else None
+
+
+def build_method1_risk_perturb_rejected(chosen_trace: str, rng: random.Random) -> str | None:
+    """
+    Rejected trace = chosen ``<logic>`` / ``<response>`` verbatim; only ``<risk_factors>`` inner changes.
+
+    Strategies (stochastic):
+      - If a visual risk was identified: often replace factors with **plausible mislabels** derived
+        from the gold tokens (toy/prop/replica/shadow-style confusions); sometimes ``no risk``.
+      - If ``no risk``: inject **scene-plausible false positives** (ambiguous shapes, reflections, …)
+        so the text is wrong but not random word salad.
+    """
+    parsed = parse_trace_for_rejection(chosen_trace, "method1")
+    if parsed is None:
+        return None
+    inner = extract_risk_inner_semantic(chosen_trace)
+    if inner is None:
+        return None
+    if inner.lower() == "no risk":
+        factors = ["no risk"]
+    else:
+        factors = [r.strip() for r in inner.split(",") if r.strip()] or ["no risk"]
+
+    if parsed.has_visual_risk:
+        r = rng.random()
+        if r < 0.22:
+            new_inner = "no risk"
+        elif r < 0.88:
+            new_inner = _similar_wrong_semantic_csv([f for f in factors if f.lower() != "no risk"], rng)
+        else:
+            new_inner = ", ".join(
+                _plausible_wrong_factor(f, rng) for f in factors if f.lower() != "no risk"
+            ) or "benign prop, neutral background"
+    else:
+        new_inner = rng.choice(_FALSE_POSITIVE_WHEN_NO_RISK)
+
+    new_block = f"<risk_factors>\n{new_inner}\n</risk_factors>"
+    return _replace_semantic_risk_block(chosen_trace, new_block)
+
+
+def _misphrase_spatial_box_lines(risk_inner: str, rng: random.Random) -> str:
+    """Keep box coordinates; replace quoted phrases with **plausible mislabels** tied to each phrase."""
+    lines_out: list[str] = []
+    for raw_line in risk_inner.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = _PHRASE_BOX_LINE_RE.match(line)
+        if not m:
+            lines_out.append(raw_line.rstrip())
+            continue
+        phrase = m.group("phrase")
+        box_raw = m.group("box")
+        wrong = _plausible_wrong_factor(phrase, rng)
+        lines_out.append(f'phrase: "{wrong}" | box: {box_raw}')
+    return "\n".join(lines_out) if lines_out else risk_inner
+
+
+def build_method2_risk_perturb_rejected(chosen_trace: str, rng: random.Random) -> str | None:
+    """
+    Rejected trace = chosen ``<logic>`` / ``<response>`` verbatim; only ``<risk_factors_with_boxes>`` inner changes.
+
+    Strategies:
+      - If inner is ``no risk``: inject fake phrase/box lines (false spatial claims).
+      - Else: either collapse to ``no risk`` (denies visible risks), or keep boxes but mislabel phrases.
+    """
+    inner = extract_risk_inner_spatial(chosen_trace)
+    if inner is None:
+        return None
+    low = inner.lower().strip()
+    if low == "no risk":
+        # False spatial claims that sound like cautious misreads of a benign image.
+        new_inner = (
+            'phrase: "shadow resembling weapon" | box: [0050, 0050, 0300, 0300]\n'
+            'phrase: "ambiguous dark shape" | box: [0400, 0400, 0700, 0700]'
+        )
+    else:
+        r = rng.random()
+        if r < 0.45:
+            new_inner = "no risk"
+        else:
+            new_inner = _misphrase_spatial_box_lines(inner, rng)
+
+    pattern = re.compile(
+        rf"(<{TAG_RISK_WITH_BOXES}>\s*)(.*?)(\s*</{TAG_RISK_WITH_BOXES}>)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    def repl(m: re.Match[str]) -> str:
+        return m.group(1) + new_inner + m.group(3)
+
+    replaced, n = pattern.subn(repl, chosen_trace, count=1)
+    return replaced.strip() if n == 1 else None
+
+
+def build_format_break_rejected(chosen_trace: str, method: MethodTag, rng: random.Random) -> str | None:
+    """
+    Produce **invalid** XML-style layout (wrong tag names, mismatched closers, bad order, or preamble),
+    reusing the same inner text blobs from the chosen trace. Use this as a DPO negative for the
+    paper's format-fail branch (``alpha_format``): the policy should learn to avoid degenerate markup.
+    """
+    parsed = parse_trace_for_rejection(chosen_trace, method)
+    if parsed is None:
+        return None
+    risk_block = parsed.risk_block_verbatim
+    logic_inner = parsed.logic_inner
+    response_inner = parsed.response_inner
+    risk_inner = (
+        extract_risk_inner_semantic(chosen_trace)
+        if method == "method1"
+        else extract_risk_inner_spatial(chosen_trace)
+    )
+    if risk_inner is None:
+        return None
+
+    variant = rng.randrange(6)
+
+    if variant == 0:
+        return (
+            f"{risk_block}\n"
+            f"<logic>\n{logic_inner}\n</thinking>\n"
+            f"<response>\n{response_inner}\n</response>"
+        ).strip()
+    if variant == 1:
+        return (
+            f"{risk_block}\n"
+            f"<logic>\n{logic_inner}\n</logic>\n"
+            f"<response>\n{response_inner}"
+        ).strip()
+    if variant == 2:
+        if method == "method1":
+            rb = f"<risk_factor>\n{risk_inner}\n</risk_factor>"
+        else:
+            rb = f"<risk_factors_with_box>\n{risk_inner}\n</risk_factors_with_box>"
+        return (
+            f"{rb}\n"
+            f"<logic>\n{logic_inner}\n</logic>\n"
+            f"<response>\n{response_inner}\n</response>"
+        ).strip()
+    if variant == 3:
+        # Unclosed ``<logic>`` so ``<response>`` appears inside the logic region (parse fail).
+        return (
+            f"{risk_block}\n"
+            f"<logic>\n{logic_inner}\n"
+            f"<response>\n{response_inner}\n</response>"
+        ).strip()
+    if variant == 4:
+        if method == "method2":
+            bad_risk = risk_block.replace(
+                f"</{TAG_RISK_WITH_BOXES}>",
+                f"</{TAG_RISK_WITH_BOXES}s>",
+                1,
+            )
+            risk_header = bad_risk
+        else:
+            risk_header = f"Here is my analysis:\n{risk_block}"
+        return (
+            f"{risk_header}\n"
+            f"<logic>\n{logic_inner}\n</logic>\n"
+            f"<response>\n{response_inner}\n</response>"
+        ).strip()
+
+    # variant == 5: malformed opening risk tag (missing ``>`` on the first line).
+    if method == "method1":
+        rb = f"<risk_factors\n{risk_inner}\n</risk_factors>"
+    else:
+        rb = f"<{TAG_RISK_WITH_BOXES}\n{risk_inner}\n</{TAG_RISK_WITH_BOXES}>"
+    return (
+        f"{rb}\n"
+        f"<logic>\n{logic_inner}\n</logic>\n"
+        f"<response>\n{response_inner}\n</response>"
+    ).strip()
 
 
 def build_method2_bbox_perturb_rejected(

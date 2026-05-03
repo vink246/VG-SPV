@@ -5,19 +5,45 @@ Fill ``rejected_reasoning_trace`` for VG-SPV DPO CSVs using:
     branch C is fully hardcoded (no LM).
   - **bbox_perturb** (Method 2 only): corrupt ``<risk_factors_with_boxes>`` coordinates;
     ``<logic>`` / ``<response>`` stay verbatim from the chosen trace.
+  - **risk_perturb**: wrong ``<risk_factors>`` / ``<risk_factors_with_boxes>`` content only
+    (false ``no risk``, plausible false positives, or **confusable** substitutes like
+    ``knife`` -> ``butter knife``); ``<logic>`` / ``<response>`` stay **verbatim** from chosen.
+  - **format_break**: same text blobs as chosen but **broken markup** (wrong tag names, bad closers,
+    wrong segment order, preamble, or truncated open tags) for format-fail / ``alpha_format`` training.
 
-Invoke from repo root:
+**Logic / response handling (by design)**:
+  - ``risk_perturb`` / ``bbox_perturb``: logic + response **unchanged** from chosen (only risk/boxes wrong).
+  - ``abliterated``: branches A/B keep chosen **risk** verbatim, rewrite **Step 2–3** logic to a fixed
+    compliant line, and sample a new **response** from the abliterated LM; branch C is fully rule-based.
+  - ``format_break``: copies chosen inners but wraps them in **invalid** XML.
+
+Each enabled mode emits **one output row per input row** (so multiple modes multiply rows).
+The optional column ``rejected_variant`` records which mode produced that row.
+
+**Question text for abliterated** (in order): CSV column ``prompt``, then ``question`` /
+``user_query``, then metadata lookup by normalized ``image`` path. Metadata JSONL is
+optional if every row already carries the user query in the CSV.
+
+Invoke from repo root (paths match ``{split}_method1.csv`` / ``{split}_method2.csv`` or
+any CSV with the same core columns):
+
+    # Quick peek (first 2 rows, print rejected text; no GPU if you omit abliterated):
+    python -m scripts.generate_rejected_traces \\
+        --input data/mm-safebench_1/extracted_data/traces/test_method1.csv \\
+        --output outputs/sample_rejected.csv \\
+        --method method1 --rejection-modes risk_perturb format_break \\
+        --limit 2 --print-preview 4
 
     python -m scripts.generate_rejected_traces \\
         --input data/mm-safebench_1/extracted_data/traces/test_method2.csv \\
         --output data/mm-safebench_1/extracted_data/traces/test_method2_dpo.csv \\
         --split test \\
         --method method2 \\
-        --rejection-modes abliterated bbox_perturb
+        --rejection-modes abliterated bbox_perturb risk_perturb format_break
 
-Requires metadata JSONL (default ``{dataset_dir}/{split}_metadata.jsonl``) to recover the
-MM-SafetyBench **question** text; join keys match ``scripts.generate_method1_traces``
-collect semantics (run with **cwd = repo root** so ``image`` paths align).
+Metadata (default ``{dataset_dir}/{split}_metadata.jsonl``) is used only to fill missing
+questions; ``image`` keys are normalized (POSIX, slashes) to match ``scripts.generate_method1_traces``
+collect semantics when you run with **cwd = repo root**.
 """
 
 from __future__ import annotations
@@ -30,17 +56,10 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-import torch
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from inference.run_abliterated_llama import (  # noqa: E402
-    DEFAULT_MODEL_ID,
-    generate_completion,
-    load_model_and_tokenizer,
-)
 from scripts.generate_method1_traces import (  # noqa: E402
     _csv_image_field,
     _iter_metadata,
@@ -50,7 +69,10 @@ from scripts.generate_method1_traces import (  # noqa: E402
 from train.rejected_trace_builder import (  # noqa: E402
     MethodTag,
     ParsedTrace,
+    build_format_break_rejected,
+    build_method1_risk_perturb_rejected,
     build_method2_bbox_perturb_rejected,
+    build_method2_risk_perturb_rejected,
     build_rejected_trace_branch_ab,
     build_rejected_trace_branch_c,
     classify_branch,
@@ -67,6 +89,8 @@ CSV_FIELDNAMES = (
 VARIANT_COL = "rejected_variant"
 
 DEFAULT_DATASET_DIR = Path("data/mm-safebench_1/extracted_data")
+# Keep in sync with ``inference.run_abliterated_llama.DEFAULT_MODEL_ID`` without importing torch there.
+DEFAULT_ABLITERATED_MODEL_ID = "mlabonne/Meta-Llama-3.1-8B-Instruct-abliterated"
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,9 +115,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--rejection-modes",
         nargs="+",
-        choices=("abliterated", "bbox_perturb"),
+        choices=("abliterated", "bbox_perturb", "risk_perturb", "format_break"),
         default=["abliterated"],
-        help="One or both; bbox_perturb requires --method method2.",
+        help="Any combination; bbox_perturb requires --method method2.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process only the first N input rows (smoke tests / spot checks).",
+    )
+    p.add_argument(
+        "--print-preview",
+        type=int,
+        default=0,
+        help="After writing, print this many rejected traces (with variant) to stdout.",
     )
     p.add_argument(
         "--bbox-zero-iou-fraction",
@@ -101,24 +137,36 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="Per box line: probability of sampling an IoU≈0 perturbation vs partial overlap.",
     )
-    p.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
+    p.add_argument("--model-id", type=str, default=DEFAULT_ABLITERATED_MODEL_ID)
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["auto", "float16", "bfloat16", "float32"])
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help='Device for abliterated LM (default: "cuda" if torch sees a GPU else "cpu").',
+    )
     p.add_argument("--device-map", type=str, default=None)
     p.add_argument("--cache-dir", type=str, default=None)
     return p.parse_args()
 
 
-def _torch_dtype(name: str) -> torch.dtype:
+def _torch_dtype(name: str) -> Any:
+    import torch
+
     from utils import parse_dtype
 
     if name == "float32":
         return torch.float32
     return parse_dtype(name)
+
+
+def _norm_path_key(s: str) -> str:
+    """Normalize CSV / metadata image paths for dict joins (Windows vs POSIX)."""
+    return s.strip().replace("\\", "/")
 
 
 def build_question_by_image_map(
@@ -134,9 +182,19 @@ def build_question_by_image_map(
         if not rel_image or question is None:
             continue
         resolved = _resolve_image_path(str(rel_image), data_root)
-        key = _csv_image_field(resolved)
+        key = _norm_path_key(_csv_image_field(resolved))
         out[key] = str(question).strip()
     return out
+
+
+def _question_from_row(row: dict[str, str], qmap: dict[str, str]) -> str:
+    """User query for abliterated prompts: CSV columns first, then metadata by image path."""
+    for col in ("prompt", "question", "user_query"):
+        v = row.get(col)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    ik = _norm_path_key(str(row.get("image", "")))
+    return (qmap.get(ik) or "").strip()
 
 
 def row_rng(seed: int | None, row_idx: int, image_key: str) -> random.Random:
@@ -146,7 +204,31 @@ def row_rng(seed: int | None, row_idx: int, image_key: str) -> random.Random:
 
 
 def _needs_variant_column(modes: set[str]) -> bool:
-    return len(modes) > 1 or "bbox_perturb" in modes
+    return (
+        len(modes) > 1
+        or "bbox_perturb" in modes
+        or "risk_perturb" in modes
+        or "format_break" in modes
+    )
+
+
+def _output_fieldnames(rows_in: list[dict[str, str]], modes: set[str]) -> list[str]:
+    """Preserve extra CSV columns (e.g. ``prompt``); ensure core DPO columns + optional variant."""
+    seen: list[str] = []
+    for r in rows_in:
+        for k in r:
+            if k not in seen:
+                seen.append(k)
+    merged: list[str] = []
+    for c in CSV_FIELDNAMES:
+        if c not in merged:
+            merged.append(c)
+    for k in seen:
+        if k not in merged and k != VARIANT_COL:
+            merged.append(k)
+    if _needs_variant_column(modes) and VARIANT_COL not in merged:
+        merged.append(VARIANT_COL)
+    return merged
 
 
 def run_abliterated_rejected(
@@ -157,6 +239,8 @@ def run_abliterated_rejected(
     tokenizer: Any,
     args: argparse.Namespace,
 ) -> str | None:
+    from inference.run_abliterated_llama import generate_completion
+
     br = classify_branch(parsed)
     if br == "C":
         return build_rejected_trace_branch_c(
@@ -194,20 +278,29 @@ def main() -> None:
     dataset_dir = Path(args.dataset_dir)
     data_root = Path(args.data_root) if args.data_root else dataset_dir
     meta_path = Path(args.metadata) if args.metadata else dataset_dir / f"{args.split}_metadata.jsonl"
-    if "abliterated" in modes:
-        if not meta_path.is_file():
-            raise SystemExit(f"Metadata not found (required for abliterated mode): {meta_path}")
+    qmap: dict[str, str] = {}
+    if meta_path.is_file():
         qmap = build_question_by_image_map(meta_path, data_root)
-    else:
-        qmap = {}
+    elif "abliterated" in modes:
+        print(
+            f"Note: metadata not found at {meta_path}; abliterated mode will use only "
+            "CSV columns prompt/question/user_query when present."
+        )
 
     model = tokenizer = None
     if "abliterated" in modes:
+        import torch
+
+        from inference.run_abliterated_llama import load_model_and_tokenizer
+
+        device = args.device
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         torch_dtype = _torch_dtype(args.dtype)
         model, tokenizer = load_model_and_tokenizer(
             model_id=args.model_id,
             torch_dtype=torch_dtype,
-            device=args.device,
+            device=device,
             device_map=args.device_map,
             cache_dir=args.cache_dir,
         )
@@ -217,18 +310,23 @@ def main() -> None:
         raise SystemExit(f"Input CSV not found: {in_path}")
 
     rows_in = _read_csv_rows(in_path)
+    if args.limit is not None:
+        rows_in = rows_in[: max(0, int(args.limit))]
+
     out_rows: list[dict[str, str]] = []
     n_ab_fail = 0
     n_bbox_fail = 0
+    n_risk_fail = 0
+    n_format_fail = 0
 
     for idx, row in enumerate(rows_in):
         chosen = row.get("chosen_reasoning_trace", "").strip()
-        img_key = row.get("image", "").strip()
-        base_row = {k: row.get(k, "") for k in CSV_FIELDNAMES}
+        img_key = _norm_path_key(row.get("image", "").strip())
+        base_row = {k: ("" if row.get(k) is None else str(row.get(k))) for k in row}
 
         if "abliterated" in modes:
             assert model is not None and tokenizer is not None
-            question = qmap.get(img_key)
+            question = _question_from_row(row, qmap)
             parsed = parse_trace_for_rejection(chosen, method)
             if not chosen or not question or parsed is None:
                 n_ab_fail += 1
@@ -268,9 +366,40 @@ def main() -> None:
                 else:
                     n_bbox_fail += 1
 
-    fieldnames = list(CSV_FIELDNAMES)
-    if _needs_variant_column(modes):
-        fieldnames.append(VARIANT_COL)
+        if "risk_perturb" in modes:
+            if not chosen:
+                n_risk_fail += 1
+            else:
+                rng = row_rng(args.seed, idx + 17_001, img_key)
+                if method == "method1":
+                    rej_r = build_method1_risk_perturb_rejected(chosen, rng)
+                else:
+                    rej_r = build_method2_risk_perturb_rejected(chosen, rng)
+                if rej_r:
+                    r_out = dict(base_row)
+                    r_out["rejected_reasoning_trace"] = rej_r
+                    if _needs_variant_column(modes):
+                        r_out[VARIANT_COL] = "risk_perturb"
+                    out_rows.append(r_out)
+                else:
+                    n_risk_fail += 1
+
+        if "format_break" in modes:
+            if not chosen:
+                n_format_fail += 1
+            else:
+                rng = row_rng(args.seed, idx + 29_000, img_key)
+                rej_f = build_format_break_rejected(chosen, method, rng)
+                if rej_f:
+                    r_out = dict(base_row)
+                    r_out["rejected_reasoning_trace"] = rej_f
+                    if _needs_variant_column(modes):
+                        r_out[VARIANT_COL] = "format_break"
+                    out_rows.append(r_out)
+                else:
+                    n_format_fail += 1
+
+    fieldnames = _output_fieldnames(rows_in, modes)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -287,8 +416,26 @@ def main() -> None:
         fail_parts.append(f"abliterated_failures={n_ab_fail}")
     if "bbox_perturb" in modes:
         fail_parts.append(f"bbox_perturb_failures={n_bbox_fail}")
+    if "risk_perturb" in modes:
+        fail_parts.append(f"risk_perturb_failures={n_risk_fail}")
+    if "format_break" in modes:
+        fail_parts.append(f"format_break_failures={n_format_fail}")
     extra = "; ".join(fail_parts) if fail_parts else ""
     print(f"Wrote {len(out_rows)} row(s) to {out_path}" + (f" ({extra})" if extra else "") + ".")
+
+    preview_n = int(args.print_preview or 0)
+    if preview_n > 0 and out_rows:
+        print("\n--- preview: rejected_reasoning_trace (first rows) ---\n")
+        for i, r in enumerate(out_rows[:preview_n]):
+            var = r.get(VARIANT_COL, "")
+            img = (r.get("image") or "")[:120]
+            print(f"[{i}] variant={var!r} image={img!r}")
+            body = (r.get("rejected_reasoning_trace") or "").strip()
+            cap = 1200
+            if len(body) > cap:
+                print(body[:cap] + f"\n... ({len(body)} chars total)\n")
+            else:
+                print(body + "\n")
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
