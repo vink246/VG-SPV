@@ -6,8 +6,8 @@ RefCOCO, RefCOCO+, and RefCOCOg. We default to PaDT-processed HF releases (train
 and lmms-lab eval splits.
 
 Usage (from repo root):
-  python data/download_bounding_box_sft_datasets.py --preset all
-  python data/download_bounding_box_sft_datasets.py --dataset_id PaDT-MLLM/RefCOCO --split train
+  python scripts/download_bounding_box_sft_datasets.py --preset all
+  python scripts/download_bounding_box_sft_datasets.py --dataset_id PaDT-MLLM/RefCOCO --split train
 """
 
 from __future__ import annotations
