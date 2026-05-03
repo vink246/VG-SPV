@@ -9,16 +9,24 @@ test_method*.csv), then copies the corresponding `question` field into a new
 Paths are matched flexibly: exact string, POSIX-style slashes, paths resolved
 relative to the repo root, and basename fallback within the chosen metadata file.
 
+Default layout (paths relative to repo root):
+
+  data/mm-safebench_1/extracted_data/train_metadata.csv
+  data/mm-safebench_1/extracted_data/test_metadata.csv
+  data/mm-safebench_1/extracted_data/traces/train_method{1,2}.csv
+  data/mm-safebench_1/extracted_data/traces/test_method{1,2}.csv
+
+Relative CLI arguments (--metadata-dir, --traces-dir, --inputs) are resolved
+against --repo-root so jobs on PACE ICE work regardless of current working directory.
+
 Usage (from repo root; do not run unless you intend to rewrite files):
 
   python scripts/add_prompts_from_mm_safebench_metadata.py --dry-run
-  python scripts/add_prompts_from_mm_safebench_metadata.py \\
-      --metadata-dir /path/to/scratch/LLM/VG-SPV/data/mm-safebench_1/extracted_data \\
-      --in-place
+  python scripts/add_prompts_from_mm_safebench_metadata.py --in-place
 
-  # Safer default: write *_with_prompt.csv next to each input
   python scripts/add_prompts_from_mm_safebench_metadata.py \\
-      --metadata-dir data/mm-safebench_1/extracted_data
+      --metadata-dir data/mm-safebench_1/extracted_data \\
+      --traces-dir data/mm-safebench_1/extracted_data/traces
 """
 
 from __future__ import annotations
@@ -33,14 +41,35 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-DEFAULT_TRAIN_CSVS = [
-    _REPO_ROOT / "data" / "train" / "train_method1.csv",
-    _REPO_ROOT / "data" / "train" / "train_method2.csv",
-]
-DEFAULT_TEST_CSVS = [
-    _REPO_ROOT / "data" / "test" / "test_method1.csv",
-    _REPO_ROOT / "data" / "test" / "test_method2.csv",
-]
+# Relative to repo root (portable on PACE ICE and local checkouts).
+_METADATA_DIR = Path("data") / "mm-safebench_1" / "extracted_data"
+_TRACES_DIR = _METADATA_DIR / "traces"
+
+
+def resolve_cli_path(path: Path, repo_root: Path) -> Path:
+    """Resolve a user-supplied path; relative paths are anchored at repo_root."""
+    path = Path(path)
+    return path.resolve() if path.is_absolute() else (repo_root / path).resolve()
+
+
+def metadata_split_for_input(csv_path: Path) -> str | None:
+    """
+    Decide whether to use train_metadata or test_metadata.
+
+    Prefer filename prefixes (traces/train_method1.csv -> train). Fall back to
+    a parent directory named 'train' or 'test' for older layouts.
+    """
+    name = csv_path.name.lower()
+    if name.startswith("train_"):
+        return "train"
+    if name.startswith("test_"):
+        return "test"
+    parts = {p.lower() for p in csv_path.parts}
+    if "train" in parts:
+        return "train"
+    if "test" in parts:
+        return "test"
+    return None
 
 
 def _posix(s: str) -> str:
@@ -185,8 +214,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--metadata-dir",
         type=Path,
-        default=_REPO_ROOT / "data" / "mm-safebench_1" / "extracted_data",
-        help="Directory containing train_metadata.csv and test_metadata.csv.",
+        default=None,
+        help=(
+            "Directory containing train_metadata.csv and test_metadata.csv "
+            "(default: data/mm-safebench_1/extracted_data under --repo-root)."
+        ),
+    )
+    p.add_argument(
+        "--traces-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory holding trace CSVs when --inputs is omitted "
+            "(default: data/mm-safebench_1/extracted_data/traces under --repo-root)."
+        ),
     )
     p.add_argument(
         "--train-metadata",
@@ -205,7 +246,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         nargs="*",
         default=None,
-        help="Explicit CSV paths; default: data/train/train_method{1,2}.csv and data/test/test_method{1,2}.csv.",
+        help=(
+            "Explicit trace CSV paths; default: train_method{1,2}.csv and test_method{1,2}.csv "
+            "under --traces-dir."
+        ),
     )
     p.add_argument(
         "--in-place",
@@ -229,9 +273,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     repo_root = args.repo_root.resolve()
-    meta_dir = args.metadata_dir.resolve()
-    train_meta = (args.train_metadata or meta_dir / "train_metadata.csv").resolve()
-    test_meta = (args.test_metadata or meta_dir / "test_metadata.csv").resolve()
+    meta_dir = resolve_cli_path(args.metadata_dir or _METADATA_DIR, repo_root)
+    traces_dir = resolve_cli_path(args.traces_dir or _TRACES_DIR, repo_root)
+    train_meta = resolve_cli_path(
+        args.train_metadata or (meta_dir / "train_metadata.csv"),
+        repo_root,
+    )
+    test_meta = resolve_cli_path(
+        args.test_metadata or (meta_dir / "test_metadata.csv"),
+        repo_root,
+    )
 
     if not train_meta.is_file():
         print(f"error: train metadata not found: {train_meta}", file=sys.stderr)
@@ -244,9 +295,14 @@ def main() -> int:
     test_lookup = build_lookup(test_meta, repo_root)
 
     if args.inputs:
-        inputs = [p.resolve() for p in args.inputs]
+        inputs = [resolve_cli_path(p, repo_root) for p in args.inputs]
     else:
-        inputs = [*DEFAULT_TRAIN_CSVS, *DEFAULT_TEST_CSVS]
+        inputs = [
+            traces_dir / "train_method1.csv",
+            traces_dir / "train_method2.csv",
+            traces_dir / "test_method1.csv",
+            traces_dir / "test_method2.csv",
+        ]
 
     missing_inputs = [p for p in inputs if not p.is_file()]
     if missing_inputs:
@@ -260,17 +316,15 @@ def main() -> int:
     total_rows = 0
     total_unmatched = 0
     for csv_path in inputs:
-        parts = {s.lower() for s in csv_path.parts}
-        if "train" in parts:
+        split = metadata_split_for_input(csv_path)
+        if split == "train":
             lookup = train_lookup
-            split = "train"
-        elif "test" in parts:
+        elif split == "test":
             lookup = test_lookup
-            split = "test"
         else:
             print(
-                f"error: cannot infer train vs test from path (expected 'train' or 'test' "
-                f"in directories): {csv_path}",
+                f"error: cannot infer train vs test (name with train_* / test_* prefix, "
+                f"or path under a train/ or test/ directory): {csv_path}",
                 file=sys.stderr,
             )
             return 1
