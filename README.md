@@ -218,6 +218,7 @@ Training data is stored as **CSV** files with the following columns (headers may
 - **Eval HF rows (for `eval_loss`):** The script tries, in order, **`--eval_split`** (default **`val`**), then **`validation`**, then **`test`**. If none of those splits load or they are empty, it **holds out** **`--hf_eval_holdout_fraction`** (default **0.02**) of the **loaded train HF** split into a disjoint eval shard (train HF is then the remainder). Cap eval HF rows after loading with **`--eval_max_samples`**.
 - **Hub vs local disk:** A **`--dataset_id`** or **`--extra_dataset`** value that is an existing directory is loaded with **`datasets.load_from_disk`** (must be a dataset saved with `Dataset.save_to_disk` / `DatasetDict.save_to_disk`). Hub ids use **`datasets.load_dataset`**. For **offline / PACE** cache mirrors, point **`HF_HOME`** (or related HF env vars) at scratch and pass **`--hf_local_files_only`** so hub loads do not hit the network.
 - **More REC data:** PaDT hosts RefCOCO / RefCOCO+ / RefCOCOg under [`PaDT-MLLM`](https://huggingface.co/PaDT-MLLM); lmms-lab hubs expose **`val`** splits for IoU eval (`eval/run_bounding_box_sft_eval.py`). The downloader [`scripts/download_bounding_box_sft_datasets.py`](scripts/download_bounding_box_sft_datasets.py) presets **`train_rec`** / **`eval_rec`** warm the cache.
+- **PaDT builder config:** On current Hugging Face `datasets`, these PaDT hubs typically expose a single builder config named **`default`**. Do **not** pass `--dataset_config refcoco` (that name is not registered); omit **`--dataset_config`** or set **`--dataset_config default`** if you need to be explicit. If unsure, run `from datasets import get_dataset_config_names; print(get_dataset_config_names("PaDT-MLLM/RefCOCO"))` in Python.
 
 ### MM-SafetyBench Method 2 CSVs (VG-SPV traces)
 
@@ -252,7 +253,7 @@ MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct OUTPUT_DIR=outputs/bbox_sft_
 # Example: extra PaDT hubs + offline hub cache on a cluster:
 # export HF_HOME=$SCRATCH/huggingface
 # MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct bash scripts/run_bounding_box_sft.sh \
-#   --hf_local_files_only --dataset_config refcoco \
+#   --hf_local_files_only \
 #   --extra_dataset PaDT-MLLM/RefCOCOPlus --extra_dataset PaDT-MLLM/RefCOCOg
 
 # Or invoke Python directly (Windows-friendly)

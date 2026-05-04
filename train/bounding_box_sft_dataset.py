@@ -192,7 +192,7 @@ def _load_one_bbox_sft_source(
     dataset_id_or_path: str,
     split: str,
     *,
-    trust_remote_code: bool = True,
+    trust_remote_code: bool = False,
     config_name: str | None = None,
     local_files_only: bool = False,
 ):
@@ -214,7 +214,9 @@ def _load_one_bbox_sft_source(
             return d[split]
         return d
 
-    kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    kwargs: dict[str, Any] = {}
+    if trust_remote_code:
+        kwargs["trust_remote_code"] = True
     if config_name:
         kwargs["name"] = config_name
     if local_files_only:
@@ -227,7 +229,7 @@ def load_bbox_sft_hf_datasets(
     split: str,
     *,
     max_samples: int | None = None,
-    trust_remote_code: bool = True,
+    trust_remote_code: bool = False,
     config_name: str | None = None,
     local_files_only: bool = False,
 ):
@@ -271,7 +273,7 @@ def load_bbox_sft_hf_dataset(
     split: str,
     *,
     max_samples: int | None = None,
-    trust_remote_code: bool = True,
+    trust_remote_code: bool = False,
     config_name: str | None = None,
     local_files_only: bool = False,
 ):

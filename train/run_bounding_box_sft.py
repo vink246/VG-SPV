@@ -126,7 +126,13 @@ def parse_args() -> argparse.Namespace:
         metavar="ID_OR_PATH",
         help="Additional hub id or save_to_disk path (repeatable). All sources are concatenated after --dataset_id.",
     )
-    p.add_argument("--dataset_config", type=str, default=None, help="Optional HF config name for the dataset.")
+    p.add_argument(
+        "--dataset_config",
+        type=str,
+        default=None,
+        help="Optional HF builder config (``name=``). PaDT RefCOCO hubs on recent ``datasets`` expose "
+        "``default`` only — omit this flag or pass ``default``. Wrong names raise ValueError (available configs).",
+    )
     p.add_argument("--split", type=str, default="train", help="Dataset split (PaDT RefCOCO uses `train`).")
     p.add_argument(
         "--hf_local_files_only",

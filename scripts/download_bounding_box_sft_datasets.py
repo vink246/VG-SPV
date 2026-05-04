@@ -49,7 +49,7 @@ PRESETS["all"] = _build_all_preset()
 def touch_dataset(dataset_id: str, split: str, config_name: str | None, max_rows: int) -> None:
     from datasets import load_dataset
 
-    kwargs: dict = {"trust_remote_code": True}
+    kwargs: dict = {}
     if config_name:
         kwargs["name"] = config_name
     print(f"Loading {dataset_id} split={split} ...")
