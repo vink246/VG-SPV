@@ -9,6 +9,10 @@ Saved layout (compatible with `inference/run_inference.py --lora-adapter` and `t
   ``{output_dir}/adapter_latest`` — overwritten on each periodic save (crash recovery)
 
 Requires: torch, transformers, peft, datasets, accelerate, pillow.
+
+By default, uses HF ``train`` / ``val`` (or holdout from train) for REC loss plus
+``data/.../train_method2.csv`` mixed into training and ``test_method2.csv`` for eval loss
+(``eval_loss`` in logs). Disable with ``--skip_eval`` / ``--no_vgspv_csv``.
 """
 
 from __future__ import annotations
@@ -29,10 +33,14 @@ from transformers import Trainer, TrainerCallback, TrainingArguments
 from train.bounding_box_sft_collator import BoundingBoxSFTCollator
 from train.bounding_box_sft_dataset import load_bbox_sft_hf_datasets, load_vgspv_csv_rows_for_sft
 from train.bounding_box_sft_schema import BOX_COORD_SCALE
-from train.bounding_box_sft_torch_dataset import BoundingBoxSFTMixedIndexDataset
+from train.bounding_box_sft_torch_dataset import BoundingBoxSFTConcatEvalDataset, BoundingBoxSFTMixedIndexDataset
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION
 from train.lora_factory import attach_lora, default_lora_config
 from vlm import load_vlm
+
+_DEFAULT_MM_TRAIN_CSV = _REPO_ROOT / "data/mm-safebench_1/extracted_data/traces/train_method2.csv"
+_DEFAULT_MM_EVAL_CSV = _REPO_ROOT / "data/mm-safebench_1/extracted_data/traces/test_method2.csv"
+_EVAL_SPLIT_FALLBACKS = ("val", "validation", "test")
 
 
 def _save_peft_bundle(model: torch.nn.Module, tokenizer, processor, dest: Path) -> None:
@@ -130,13 +138,13 @@ def parse_args() -> argparse.Namespace:
         "--vgspv_csv",
         type=str,
         default=None,
-        help="Optional VG-fDPO-style CSV (image, chosen_reasoning_trace, …) to mix into SFT.",
+        help="Train VG-SPV CSV (image, chosen_reasoning_trace, …). Default: repo train_method2.csv if present.",
     )
     p.add_argument(
         "--vgspv_mix_fraction",
         type=float,
-        default=0.0,
-        help="Fraction of steps that sample from --vgspv_csv (0–1). Ignored if no CSV.",
+        default=0.25,
+        help="Fraction of train steps from VG-SPV CSV vs HF (0–1). Ignored when no train CSV is loaded.",
     )
     p.add_argument(
         "--vgspv_prompt_instruction",
@@ -199,7 +207,75 @@ def parse_args() -> argparse.Namespace:
         choices=["qwen3_vl", "llava", "tinyllava", "mllama"],
         help="Optional backend override (see vlm/registry.py).",
     )
+    p.add_argument(
+        "--eval_split",
+        type=str,
+        default="val",
+        help="HF split for eval loss (tried first, then validation, test). If none load, see --hf_eval_holdout_fraction.",
+    )
+    p.add_argument(
+        "--hf_eval_holdout_fraction",
+        type=float,
+        default=0.02,
+        help="If no HF eval split loads, hold out this fraction of train HF rows for eval (disjoint).",
+    )
+    p.add_argument(
+        "--eval_max_samples",
+        type=int,
+        default=None,
+        help="Cap HF eval rows after loading (None = all).",
+    )
+    p.add_argument(
+        "--eval_steps",
+        type=int,
+        default=None,
+        help="Run eval every N steps (default: max(logging_steps, 50)). Ignored with --skip_eval.",
+    )
+    p.add_argument("--per_device_eval_batch_size", type=int, default=1)
+    p.add_argument("--skip_eval", action="store_true", help="Disable eval loss (train loss only).")
+    p.add_argument(
+        "--vgspv_eval_csv",
+        type=str,
+        default=None,
+        help="CSV for eval (default: test_method2.csv under repo if present).",
+    )
+    p.add_argument(
+        "--no_vgspv_csv",
+        action="store_true",
+        help="Do not mix train_method2.csv even if the default file exists.",
+    )
     return p.parse_args()
+
+
+def _try_load_hf_eval(
+    sources: list[str],
+    preferred_split: str,
+    *,
+    config_name: str | None,
+    local_files_only: bool,
+    max_eval_samples: int | None,
+):
+    """Return (dataset, split_name_used) or (None, None)."""
+    order: list[str] = []
+    if preferred_split and preferred_split.strip():
+        order.append(preferred_split.strip())
+    for s in _EVAL_SPLIT_FALLBACKS:
+        if s not in order:
+            order.append(s)
+    for sp in order:
+        try:
+            ds = load_bbox_sft_hf_datasets(
+                sources,
+                sp,
+                max_samples=max_eval_samples,
+                config_name=config_name,
+                local_files_only=local_files_only,
+            )
+            if len(ds) > 0:
+                return ds, sp
+        except Exception:
+            continue
+    return None, None
 
 
 def main() -> None:
@@ -220,7 +296,7 @@ def main() -> None:
         raise SystemExit("Bounding-box SFT requires a processor (LLaVA / Mllama / Qwen-VL).")
 
     sources = [args.dataset_id] + list(args.extra_dataset or [])
-    hf_ds = load_bbox_sft_hf_datasets(
+    hf_train_full = load_bbox_sft_hf_datasets(
         sources,
         args.split,
         max_samples=args.max_samples,
@@ -228,28 +304,95 @@ def main() -> None:
         local_files_only=bool(args.hf_local_files_only),
     )
 
-    csv_rows: list | None = None
+    hf_eval_ds = None
+    eval_split_used: str | None = None
+    hf_train = hf_train_full
+    if not args.skip_eval:
+        hf_eval_ds, eval_split_used = _try_load_hf_eval(
+            sources,
+            args.eval_split,
+            config_name=args.dataset_config,
+            local_files_only=bool(args.hf_local_files_only),
+            max_eval_samples=args.eval_max_samples,
+        )
+        if hf_eval_ds is None or len(hf_eval_ds) == 0:
+            hold = float(args.hf_eval_holdout_fraction)
+            if hold <= 0.0 or hold >= 1.0:
+                raise SystemExit(
+                    "No HF eval split could be loaded; set --hf_eval_holdout_fraction in (0, 1) "
+                    "to hold out part of train, or use --skip_eval."
+                )
+            split_d = hf_train_full.train_test_split(test_size=hold, seed=int(args.mix_seed))
+            hf_train = split_d["train"]
+            hf_eval_ds = split_d["test"]
+            eval_split_used = f"train_holdout_{hold:g}"
+            print(f"HF eval: holdout {hold * 100:.3g}% of train rows (no hub val/validation/test).")
+        else:
+            print(f"HF eval: hub split {eval_split_used!r} ({len(hf_eval_ds)} rows).")
+        if args.eval_max_samples is not None and len(hf_eval_ds) > int(args.eval_max_samples):
+            hf_eval_ds = hf_eval_ds.select(range(int(args.eval_max_samples)))
+    else:
+        hf_eval_ds = None
+
     vgspv_prompt = args.vgspv_prompt_instruction or DEFAULT_PROMPT_INSTRUCTION
     img_root = Path(args.vgspv_image_root).resolve() if args.vgspv_image_root else None
-    if args.vgspv_csv:
-        csv_rows = load_vgspv_csv_rows_for_sft(args.vgspv_csv, image_root=img_root)
-        mf = float(args.vgspv_mix_fraction)
-        if mf <= 0:
-            raise SystemExit("--vgspv_csv requires --vgspv_mix_fraction > 0.")
-    elif args.vgspv_mix_fraction > 0:
-        raise SystemExit("--vgspv_mix_fraction > 0 requires --vgspv_csv.")
+
+    train_csv_path: Path | None = None
+    if args.no_vgspv_csv:
+        train_csv_path = None
+    elif args.vgspv_csv:
+        train_csv_path = Path(args.vgspv_csv).expanduser().resolve()
+        if not train_csv_path.is_file():
+            raise SystemExit(f"--vgspv_csv not found: {train_csv_path}")
+    elif _DEFAULT_MM_TRAIN_CSV.is_file():
+        train_csv_path = _DEFAULT_MM_TRAIN_CSV.resolve()
+    else:
+        train_csv_path = None
+
+    csv_rows: list | None = None
+    mix_fraction = 0.0
+    if train_csv_path is not None:
+        csv_rows = load_vgspv_csv_rows_for_sft(str(train_csv_path), image_root=img_root)
+        mix_fraction = float(args.vgspv_mix_fraction)
+        if mix_fraction <= 0.0:
+            raise SystemExit("Train VG-SPV CSV is loaded but --vgspv_mix_fraction must be > 0.")
+
+    eval_csv_path: Path | None = None
+    if args.skip_eval:
+        eval_csv_path = None
+    elif args.vgspv_eval_csv:
+        eval_csv_path = Path(args.vgspv_eval_csv).expanduser().resolve()
+        if not eval_csv_path.is_file():
+            raise SystemExit(f"--vgspv_eval_csv not found: {eval_csv_path}")
+    elif _DEFAULT_MM_EVAL_CSV.is_file():
+        eval_csv_path = _DEFAULT_MM_EVAL_CSV.resolve()
+    else:
+        eval_csv_path = None
+
+    csv_eval_rows: list | None = None
+    if eval_csv_path is not None:
+        csv_eval_rows = load_vgspv_csv_rows_for_sft(str(eval_csv_path), image_root=img_root)
+
+    eval_ds: BoundingBoxSFTConcatEvalDataset | None = None
+    if not args.skip_eval:
+        eval_ds = BoundingBoxSFTConcatEvalDataset(hf_eval_ds, csv_eval_rows)
+        if len(eval_ds) == 0:
+            eval_ds = None
+            print("Eval disabled: empty HF eval and empty eval CSV.")
 
     collator = BoundingBoxSFTCollator(
         loaded.processor,
-        hf_ds,
+        hf_train,
         loaded.family,
+        hf_eval=None if args.skip_eval else hf_eval_ds,
         csv_rows=csv_rows,
+        csv_eval_rows=None if args.skip_eval else csv_eval_rows,
         vgspv_prompt_instruction=vgspv_prompt,
     )
     torch_ds = BoundingBoxSFTMixedIndexDataset(
-        hf_ds,
+        hf_train,
         csv_rows,
-        mix_fraction=args.vgspv_mix_fraction if csv_rows else 0.0,
+        mix_fraction=mix_fraction if csv_rows else 0.0,
         seed=args.mix_seed,
     )
 
@@ -297,6 +440,11 @@ def main() -> None:
     )
     if save_strategy == "steps":
         targs_kw["save_steps"] = save_steps_val
+    if eval_ds is not None and len(eval_ds) > 0:
+        eval_steps = int(args.eval_steps) if args.eval_steps is not None else max(int(args.logging_steps), 50)
+        targs_kw["evaluation_strategy"] = "steps"
+        targs_kw["eval_steps"] = max(1, eval_steps)
+        targs_kw["per_device_eval_batch_size"] = int(args.per_device_eval_batch_size)
     targs = TrainingArguments(**targs_kw)
 
     callbacks: list[TrainerCallback] = [
@@ -316,6 +464,7 @@ def main() -> None:
         model=model,
         args=targs,
         train_dataset=torch_ds,
+        eval_dataset=eval_ds if eval_ds is not None and len(eval_ds) > 0 else None,
         data_collator=collator,
         callbacks=callbacks,
     )
@@ -338,11 +487,26 @@ def main() -> None:
         "hf_local_files_only": bool(args.hf_local_files_only),
         "split": args.split,
         "max_samples": args.max_samples,
+        "eval_split_requested": args.eval_split,
+        "eval_split_used": eval_split_used,
+        "hf_eval_holdout_fraction": float(args.hf_eval_holdout_fraction),
+        "eval_max_samples": args.eval_max_samples,
+        "eval_steps": (int(args.eval_steps) if args.eval_steps is not None else max(int(args.logging_steps), 50))
+        if eval_ds and len(eval_ds) > 0
+        else None,
+        "per_device_eval_batch_size": int(args.per_device_eval_batch_size)
+        if eval_ds and len(eval_ds) > 0
+        else None,
+        "skip_eval": bool(args.skip_eval),
+        "eval_dataset_len": len(eval_ds) if eval_ds is not None else 0,
+        "vgspv_train_csv": str(train_csv_path) if train_csv_path else None,
         "vgspv_csv": args.vgspv_csv,
-        "vgspv_mix_fraction": args.vgspv_mix_fraction if csv_rows else 0.0,
+        "vgspv_eval_csv": str(eval_csv_path) if eval_csv_path else None,
+        "vgspv_mix_fraction": mix_fraction if csv_rows else 0.0,
         "vgspv_prompt_instruction": vgspv_prompt if csv_rows else None,
         "vgspv_image_root": str(img_root) if img_root else None,
         "mix_seed": args.mix_seed,
+        "no_vgspv_csv": bool(args.no_vgspv_csv),
         "resume_adapter_path": args.resume_adapter_path,
         "save_every_steps": args.save_every_steps,
         "save_every_n_epochs": args.save_every_n_epochs,

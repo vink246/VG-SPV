@@ -36,8 +36,30 @@ class BoundingBoxSFTMixedIndexDataset(torch.utils.data.Dataset):
             u = ((index * 1103515245 + self.seed) & 0x7FFFFFFF) / float(0x7FFFFFFF)
             if u < self.mix_fraction:
                 j = (index * 2654435761 + self.seed) % len(self.csv_rows)
-                return {"idx": int(j), "source": "vgspv_csv"}
-        return {"idx": int(index % len(self.hf)), "source": "hf"}
+                return {"idx": int(j), "source": "vgspv_csv", "pool": "train"}
+        return {"idx": int(index % len(self.hf)), "source": "hf", "pool": "train"}
+
+
+class BoundingBoxSFTConcatEvalDataset(torch.utils.data.Dataset):
+    """
+    Evaluation indices: all HF eval rows, then all VG-SPV CSV eval rows (disjoint from train).
+    Each item includes ``pool="eval"`` for the collator.
+    """
+
+    def __init__(self, hf_eval: Any, csv_eval_rows: list[dict] | None):
+        self.hf_eval = hf_eval
+        self.n_hf = len(hf_eval) if hf_eval is not None else 0
+        self.csv_eval = csv_eval_rows if csv_eval_rows else []
+        self.n_csv = len(self.csv_eval)
+
+    def __len__(self) -> int:
+        return self.n_hf + self.n_csv
+
+    def __getitem__(self, index: int) -> dict[str, int | str]:
+        if index < self.n_hf:
+            return {"idx": int(index), "source": "hf", "pool": "eval"}
+        j = index - self.n_hf
+        return {"idx": int(j), "source": "vgspv_csv", "pool": "eval"}
 
 
 # Back-compat alias

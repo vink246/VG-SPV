@@ -21,16 +21,20 @@ class BoundingBoxSFTCollator:
     def __init__(
         self,
         processor: Any,
-        hf_dataset: Any,
+        hf_train: Any,
         family: str,
         *,
+        hf_eval: Any | None = None,
         csv_rows: list[dict[str, Any]] | None = None,
+        csv_eval_rows: list[dict[str, Any]] | None = None,
         vgspv_prompt_instruction: str = "",
     ):
         self.processor = processor
-        self.hf = hf_dataset
+        self.hf_train = hf_train
+        self.hf_eval = hf_eval
         self.family = family
         self.csv_rows = csv_rows
+        self.csv_eval_rows = csv_eval_rows
         self.vgspv_prompt_instruction = vgspv_prompt_instruction
         tok = getattr(processor, "tokenizer", processor)
         tok.padding_side = "right"
@@ -41,17 +45,26 @@ class BoundingBoxSFTCollator:
         images: list[Any] = []
 
         for b in batch:
+            pool = b.get("pool", "train")
             src = b.get("source", "hf")
             idx = int(b["idx"])
+            if pool == "eval":
+                hf_src = self.hf_eval
+                csv_src = self.csv_eval_rows
+            else:
+                hf_src = self.hf_train
+                csv_src = self.csv_rows
             if src == "vgspv_csv":
-                if not self.csv_rows:
-                    raise ValueError("Collator received vgspv_csv batch but csv_rows is empty")
+                if not csv_src:
+                    raise ValueError("Collator received vgspv_csv batch but CSV rows for this pool are empty")
                 sample = vgspv_csv_row_to_bbox_sft_sample(
-                    self.csv_rows[idx],
+                    csv_src[idx],
                     self.vgspv_prompt_instruction,
                 )
             else:
-                sample = hf_row_to_bbox_sft_sample(self.hf[idx])
+                if hf_src is None:
+                    raise ValueError("Collator received hf batch but hf dataset for this pool is None")
+                sample = hf_row_to_bbox_sft_sample(hf_src[idx])
             messages = sample.messages
             user_only, full_msgs = _split_user_assistant(messages)
             text_prompt = self.processor.apply_chat_template(
