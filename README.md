@@ -39,9 +39,11 @@ VG-SPV/
 │   ├── generate_method2_traces.py # MM-SafetyBench Method 2 (Grounding DINO boxes)
 │   ├── generate_rejected_traces.py # Fill rejected_reasoning_trace (abliterated + bbox perturb)
 │   ├── process_hf_data.py         # Extract and organize HuggingFace dataset/benchmark data
-│   ├── download_bounding_box_sft_datasets.py  # Deprecated stub (bbox SFT uses CSV traces only)
+│   ├── draw_risk_factor_boxes.py  # Draw Method-2 `phrase: … | box: …` lines on an image
+│   ├── sanity_check_bbox_sft_datasets.py # Quick CSV + image path check before bbox SFT
+│   ├── run_bbox_sft.sbatch        # SLURM: MM-SafetyBench bbox SFT (`train/run_bounding_box_sft.py`)
 │   ├── install_datasets.sh        # HuggingFace data download and reorganization
-│   ├── run_bounding_box_sft.sh    # Launch bounding-box SFT (LoRA)
+│   ├── run_bounding_box_sft.sh    # Bash helper: bbox SFT (sets MODEL_NAME, forwards args)
 │   ├── run_dpo_train.sh           # Launch DPO training (wraps train/run_dpo.py + configs/dpo.yaml)
 │   ├── install_grounding_dino.sh  # Install Grounding DINO after env create
 │   └── install_flash_attn.sh      # Install flash-attn after env create (optional)
@@ -201,89 +203,118 @@ Training data is stored as **CSV** files with the following columns (headers may
 
 ## Bounding-box SFT (LoRA): phrases → XML + boxes
 
-**Bounding-box supervised finetuning (SFT)** is a **separate** step from VG-fDPO. It teaches supported VLMs (HF **LLaVA** and **Llama 3.2 Vision / Mllama** backends) to emit axis-aligned boxes inside the `<risk_factors_with_boxes>` segment, followed by `<logic>` and `<response>` (see `train/bounding_box_sft_schema.py`). Corners are written as **integers on a 0–1000 grid** (Shikra-style) so tokenizers do not split decimals awkwardly; `train/tag_parsing.py` accepts both that format and legacy float tuples for eval and older traces.
+**Bounding-box SFT** is a step **before** VG-fDPO. It trains supported VLMs (**LLaVA**, **Llama 3.2 Vision / Mllama**, **Qwen3-VL**) on MM-SafetyBench **Method-2 CSV** rows so the model learns `<risk_factors_with_boxes>` (then `<logic>` / `<response>`) with **0–1000 integer grid** corners; see `train/bounding_box_sft_schema.py`. `train/tag_parsing.py` parses those boxes (and float quads) for eval and tooling.
 
-**Recommended models (paper baselines):**
+**Example base models:** `llava-hf/llava-v1.6-mistral-7b-hf` (aligns with [`configs/dpo.yaml`](configs/dpo.yaml)); `meta-llama/Llama-3.2-11B-Vision-Instruct` (gated on Hugging Face).
 
-- LLaVA-v1.6-Mistral-7B class: e.g. `llava-hf/llava-v1.6-mistral-7b-hf` (matches [`configs/dpo.yaml`](configs/dpo.yaml) and `train/run_bounding_box_sft.py` defaults).
-- Llama-3.2-11B-Vision-Instruct: `meta-llama/Llama-3.2-11B-Vision-Instruct` (gated; set a Hugging Face token with access).
+### Data layout and defaults
 
-### Train loss vs eval loss during SFT
+`train/bounding_box_sft_dataset.py::load_vgspv_csv_rows_for_sft` loads **`image`**, **`chosen_reasoning_trace`**, and optional per-row **`prompt`**. If the default files exist under the repo, you can omit **`--vgspv_csv`** / **`--vgspv_eval_csv`**.
 
-- **Train loss (`loss`):** Hugging Face `Trainer` logs the running training loss every **`--logging_steps`** (default **20**).
-- **Eval loss (`eval_loss`):** When a validation CSV is available (default **`test_method2.csv`** under the repo if present), **`eval_loss`** runs at the **end of each epoch** (same cadence as **`save_strategy="epoch"`** when **`--save_every_steps`** is **0**). Use **`--skip_eval`** for train-only runs.
+| Role | Default path (used when the file exists) |
+|------|---------------------------------------------|
+| Training | `data/mm-safebench_1/extracted_data/traces/train_method2.csv` |
+| Validation (`eval_loss`) | `data/mm-safebench_1/extracted_data/traces/test_method2.csv` |
 
-### MM-SafetyBench Method-2 CSVs (only data path)
-
-Training and validation use **`load_vgspv_csv_rows_for_sft`** (`train/bounding_box_sft_dataset.py`). If these files exist under the repo, they are used **without** passing paths:
-
-| Role | Default path (if the file exists) |
-|------|-------------------------------------|
-| **Training** | `data/mm-safebench_1/extracted_data/traces/train_method2.csv` |
-| **Validation (`eval_loss`)** | `data/mm-safebench_1/extracted_data/traces/test_method2.csv` |
-
-- **`--vgspv_csv` / `--vgspv_eval_csv`:** Override defaults. Eval CSV is skipped if missing and **`--skip_eval`** is not set (trainer prints a notice).
-- **`--max_train_rows` / `--max_eval_rows`:** Optional caps after load (debug).
-- **`--eval_early_stopping_patience`:** If **> 0**, stops after that many evals with no **`eval_loss`** improvement (**epochs** when using per-epoch eval). Sets **`load_best_model_at_end`**.
-- **Columns:** **`image`** and **`chosen_reasoning_trace`** are required. Per-row **`prompt`** is used as user text when present; else **`--vgspv_prompt_instruction`** / `DEFAULT_PROMPT_INSTRUCTION`. **`--vgspv_image_root`** helps resolve relative image paths.
-
-**Check** CSV + image paths:
+**Sanity-check** images resolve and rows convert to SFT samples:
 
 ```bash
 python scripts/sanity_check_bbox_sft_datasets.py
+python scripts/sanity_check_bbox_sft_datasets.py --csv path/to/train.csv --max-rows 5 --image-root path/to/images
 ```
 
-**Run LoRA SFT:**
+### Train (LoRA SFT)
+
+- **Train loss** is logged every **`--logging_steps`** (default 20).
+- With **`--save_every_steps 0`** (default), the Hugging Face **`Trainer`** **saves a checkpoint at the end of each epoch** and runs **`eval_loss`** on the eval CSV at the same time. Use **`--skip_eval`** if you have no validation file. **`--save_optimizer_state`** includes optimizer state in checkpoints (large); default is adapter weights only.
+
+**Train — explicit paths (Linux / macOS / Git Bash):**
 
 ```bash
-MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct OUTPUT_DIR=outputs/bbox_sft_llama bash scripts/run_bounding_box_sft.sh
-
 python train/run_bounding_box_sft.py \
   --model_name meta-llama/Llama-3.2-11B-Vision-Instruct \
   --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv \
   --vgspv_eval_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv \
-  --output_dir outputs/bbox_sft_llama --bf16 --gradient_checkpointing
+  --output_dir outputs/bbox_sft_llama \
+  --bf16 --gradient_checkpointing
+```
 
+**Train — same thing via helper script** (requires `MODEL_NAME`; adds `--bf16` and `--gradient_checkpointing`):
+
+```bash
+MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct OUTPUT_DIR=outputs/bbox_sft_llama \
+  bash scripts/run_bounding_box_sft.sh \
+  --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv \
+  --vgspv_eval_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv
+```
+
+**Train — cluster (SLURM):** edit paths in `scripts/run_bbox_sft.sbatch`, then `sbatch scripts/run_bbox_sft.sbatch`.
+
+**Train — resume** from `adapter/` or `adapter_latest/`:
+
+```bash
 python train/run_bounding_box_sft.py \
   --model_name llava-hf/llava-v1.6-mistral-7b-hf \
   --resume_adapter_path outputs/bbox_sft_llava/adapter_latest \
-  --output_dir outputs/bbox_sft_llava_cont --bf16 --gradient_checkpointing
+  --output_dir outputs/bbox_sft_llava_cont \
+  --bf16 --gradient_checkpointing
 ```
 
-Full flag reference (`python train/run_bounding_box_sft.py --help` is authoritative):
+**Train — PowerShell (Windows):**
 
-| Area | Flags |
-|------|--------|
-| Model | **`--model_name`** (required), **`--model_family`**, **`--bf16`**, **`--gradient_checkpointing`** |
-| CSV data | **`--vgspv_csv`**, **`--vgspv_eval_csv`**, **`--vgspv_prompt_instruction`**, **`--vgspv_image_root`**, **`--max_train_rows`**, **`--max_eval_rows`** |
-| Eval (`eval_loss`) | **`--eval_steps`** (only with **`--save_every_steps` > 0**), **`--eval_early_stopping_patience`**, **`--per_device_eval_batch_size`**, **`--skip_eval`** |
-| Resume | **`--resume_adapter_path`** |
-| Checkpoints | **`--save_every_steps`** (**`0`** = per-epoch save + epoch **`eval_loss`**), **`--save_every_n_epochs`** (extra saves when using step mode), **`--save_total_limit`** (**`0`** = keep every epoch checkpoint), **`--save_optimizer_state`** |
-| Training | **`--epochs`**, **`--learning_rate`**, **`--per_device_train_batch_size`**, **`--gradient_accumulation_steps`**, **`--logging_steps`**, **`--warmup_ratio`**, **`--max_steps`** |
-| LoRA | **`--lora_r`**, **`--lora_alpha`**, **`--lora_dropout`** |
-| Output | **`--output_dir`** |
+```powershell
+python train/run_bounding_box_sft.py `
+  --model_name meta-llama/Llama-3.2-11B-Vision-Instruct `
+  --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv `
+  --vgspv_eval_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv `
+  --output_dir outputs/bbox_sft_llama --bf16 --gradient_checkpointing
+```
 
-**Note:** Synthesized boxes in `train/bounding_box_sft_schema.py` use **four-digit** zero-padding (0–1000 inclusive per corner) so `1000` tokenizes cleanly; eval accepts integer grid and legacy float quads.
+Useful flags (full list: `python train/run_bounding_box_sft.py --help`): **`--vgspv_image_root`**, **`--max_train_rows`**, **`--max_eval_rows`**, **`--epochs`**, **`--eval_early_stopping_patience`**, **`--save_total_limit`** (`0` = keep every epoch checkpoint), **`--save_every_steps`** / **`--eval_steps`** (step-based mode instead of per-epoch).
 
-Artifacts:
+**Artifacts:** `{output_dir}/adapter/` (final LoRA + tokenizer/processor for `inference/run_inference.py --lora-adapter` or `train/run_dpo.py --lora_adapter_path`), `{output_dir}/adapter_latest/` (mirrored on each save), `{output_dir}/bounding_box_sft_meta.json`.
 
-- **`outputs/.../adapter/`** — final PEFT adapter + tokenizer/processor (pass to `inference/run_inference.py --lora-adapter` or `train/run_dpo.py --lora_adapter_path`).
-- **`outputs/.../adapter_latest/`** — last successful periodic save (overwritten each time).
-- **`outputs/.../bounding_box_sft_meta.json`** — base model id, train/eval CSV paths and row counts, save/eval settings, LoRA hyperparameters.
+### Evaluate (teacher vs model IoU)
 
-**3) Evaluate IoU on the Method-2 test CSV:**
+After SFT, **`eval/run_method2_csv_bbox_eval.py`** scores predictions against boxes parsed from the teacher **`chosen_reasoning_trace`** in the same CSV row. Teacher and model outputs are parsed with `train/tag_parsing.py` (integer grid and float quads).
 
 ```bash
 python eval/run_method2_csv_bbox_eval.py \
   --csv data/mm-safebench_1/extracted_data/traces/test_method2.csv \
-  --model_name llava-hf/llava-v1.6-mistral-7b-hf \
-  --lora_adapter outputs/bbox_sft_llava/adapter \
-  --bf16 --max_samples 500
+  --model_name meta-llama/Llama-3.2-11B-Vision-Instruct \
+  --lora_adapter outputs/bbox_sft_llama/adapter \
+  --bf16 \
+  --max_samples 500 \
+  --output_json outputs/bbox_sft_llama/method2_iou_eval.json
 ```
 
-Metrics include **`mean_iou_mean_max_per_gt`**, **`acc_mean_max_iou_0.5`**, and **`acc_all_gt_boxes_iou_0.5`**. Box parsing: integer grid or legacy decimals (`train/tag_parsing.py`).
+Optional: **`--vgspv_image_root`**, **`--merge_adapter`**, **`--prompt_instruction`**, **`--model_family`**. JSON includes **`mean_iou_mean_max_per_gt`**, **`acc_mean_max_iou_0.5`**, **`acc_all_gt_boxes_iou_0.5`**, and related counts.
 
-**4) Inference with the adapter:**
+### Visualize boxes on an image
+
+**`scripts/draw_risk_factor_boxes.py`** overlays Method-2 style lines on a PIL image. Lines with **`no_box`** or **`[no_box]`** are skipped.
+
+Create e.g. `boxes.txt`:
+
+```
+phrase: "hand" | box: [0001, 0171, 0640, 0711]
+phrase: "gun" | box: [no_box]
+```
+
+Then run:
+
+```bash
+python scripts/draw_risk_factor_boxes.py --image path/to/image.jpg --text_file boxes.txt -o out.png
+```
+
+Inline text (escape newlines in your shell as needed):
+
+```bash
+python scripts/draw_risk_factor_boxes.py --image path/to/image.jpg \
+  --text 'phrase: "hand" | box: [0.1, 0.2, 0.5, 0.6]' -o out.png
+```
+
+### Inference with the trained adapter
 
 `--lora-adapter` accepts the same PEFT directory as training: **`adapter/`** or **`adapter_latest/`**.
 
@@ -294,7 +325,7 @@ python inference/run_inference.py --model meta-llama/Llama-3.2-11B-Vision-Instru
 
 Use `--merge-lora-adapter` to fuse LoRA into dense weights before generation (optional deployment path).
 
-**5) VG-fDPO (after bbox SFT) with the same adapter:**
+### VG-fDPO (after bbox SFT) with the same adapter
 
 ```bash
 python train/run_dpo.py --model_name llava-hf/llava-v1.6-mistral-7b-hf \
@@ -318,7 +349,7 @@ When `--lora_adapter_path` is set, **the reference model is an explicit frozen c
 2. **Data**: Run `bash scripts/install_datasets.sh` (from repo root; use Git Bash or WSL on Windows), then synthesize preferred-response traces with `python -m scripts.generate_method1_traces ...` (Method 1, default model `gpt-5.4-mini` via the Batch API on `/v1/responses`) and `python -m scripts.generate_method2_traces ...` (Method 2, Grounding DINO boxes). See [MM-SafetyBench preferred-response generation (Method 1 + Method 2)](#mm-safetybench-preferred-response-generation-method-1--method-2) below. Traces match the [dataset format](#dataset-format) (`image`, `perturbed_image`, `chosen_reasoning_trace`, `rejected_reasoning_trace`). For DPO, populate `rejected_reasoning_trace` with [`scripts/generate_rejected_traces.py`](scripts/generate_rejected_traces.py) after Method 1 or 2.
 3. **Training**: Use scripts in `scripts/` to launch VG-fDPO training (e.g. `bash scripts/run_dpo_train.sh`). Use `--model_name` (or edit [`configs/dpo.yaml`](configs/dpo.yaml)) to pick any supported VL model. Training uses **TRL**’s `DPOTrainer` subclass **`VGSPVTrainer`** ([`train/dpo_trainer.py`](train/dpo_trainer.py)) for segment-masked VG-fDPO and optional V-DPO.
 4. **Reward**: `models/reward_dino.py` provides the Grounding DINO IoU-based reward for VG-PRM. For ground-truth box generation, run `inference/run_grounding_dino.py` with `--checkpoint` (config is auto-selected from the checkpoint name).
-5. **Eval**: Method-2 CSV IoU metrics live in [`eval/run_method2_csv_bbox_eval.py`](eval/run_method2_csv_bbox_eval.py). There is no separate VisCRA ASR driver in `eval/` in this tree—wire your own benchmark scripts against `vlm` / saved adapters as needed.
+5. **Bounding-box SFT & eval**: Train with [`train/run_bounding_box_sft.py`](train/run_bounding_box_sft.py), score IoU with [`eval/run_method2_csv_bbox_eval.py`](eval/run_method2_csv_bbox_eval.py), and visualize phrase/box lines using [`scripts/draw_risk_factor_boxes.py`](scripts/draw_risk_factor_boxes.py) — see [Bounding-box SFT (LoRA)](#bounding-box-sft-lora-phrases--xml--boxes). There is no bundled VisCRA ASR driver in `eval/`; add your own drivers against `vlm` / saved adapters if needed.
 
 ---
 
@@ -382,31 +413,20 @@ phrase: "knife" | box: [0400, 0600, 0800, 0900]
 
 `no risk` propagates as a single literal `no risk` line. Risk factors with zero Grounding DINO detections are recorded as `phrase: "<risk>" | box: [no_box]` (the token doesn't match the int-grid box regex, so `train/tag_parsing.py::parse_all_norm_boxes` cleanly returns no spurious box for that line).
 
-**Trainer integration:**
+**Trainer integration:** Method-2 traces in **`train_method2.csv`** / **`test_method2.csv`** match the loader expected by **`train/run_bounding_box_sft.py`** (see [Bounding-box SFT (LoRA)](#bounding-box-sft-lora-phrases--xml--boxes) for train, IoU eval, and box-drawing commands). If those default paths exist under the repo, you can omit **`--vgspv_csv`** and **`--vgspv_eval_csv`**.
 
-- The Method 2 CSVs are **SFT-ready** for `train/run_bounding_box_sft.py`. **`train_method2.csv`** is the default **training** set; **`test_method2.csv`** is the default **validation** set for **`eval_loss`** each epoch when present (see **Bounding-box SFT (LoRA)**). Only **`image`** + **`chosen_reasoning_trace`** are required by `train/bounding_box_sft_dataset.py::load_vgspv_csv_rows_for_sft`; use the **`prompt`** column for per-row user text when present.
+The CSVs become **DPO-ready** when `rejected_reasoning_trace` is filled. Use [`scripts/generate_rejected_traces.py`](scripts/generate_rejected_traces.py) (abliterated LM branch + optional **Method 2** bbox coordinate corruption), for example:
 
-  ```bash
-  python train/run_bounding_box_sft.py --model_name llava-hf/llava-v1.6-mistral-7b-hf \
-    --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv \
-    --vgspv_eval_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv \
-    --bf16 --gradient_checkpointing
-  ```
+```bash
+python -m scripts.generate_rejected_traces \
+  --input data/mm-safebench_1/extracted_data/traces/test_method2.csv \
+  --output data/mm-safebench_1/extracted_data/traces/test_method2_dpo.csv \
+  --split test \
+  --method method2 \
+  --rejection-modes abliterated bbox_perturb
+```
 
-  If both CSVs live at the default paths under the repo, you can omit **`--vgspv_csv`** / **`--vgspv_eval_csv`** and the trainer will pick them up automatically.
-
-- The CSVs become **DPO-ready** when `rejected_reasoning_trace` is filled. Use [`scripts/generate_rejected_traces.py`](scripts/generate_rejected_traces.py) (abliterated LM branch + optional **Method 2** bbox coordinate corruption), for example:
-
-  ```bash
-  python -m scripts.generate_rejected_traces \
-    --input data/mm-safebench_1/extracted_data/traces/test_method2.csv \
-    --output data/mm-safebench_1/extracted_data/traces/test_method2_dpo.csv \
-    --split test \
-    --method method2 \
-    --rejection-modes abliterated bbox_perturb
-  ```
-
-  Method 1 / 2 trace scripts emit an empty `rejected_reasoning_trace` so the CSV schema is valid before this step; see the module docstring for metadata paths and GPU flags.
+Method 1 / 2 trace scripts emit an empty `rejected_reasoning_trace` so the CSV schema is valid before this step; see the module docstring for metadata paths and GPU flags.
 
 ---
 
