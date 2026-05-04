@@ -8,8 +8,12 @@ import unittest
 from train.rejected_trace_builder import (
     RESPONSE_REFUSAL_C,
     STEP3_SUFFIX,
+    _plausible_wrong_factor,
     assemble_trace_xml,
+    build_format_break_rejected,
+    build_method1_risk_perturb_rejected,
     build_method2_bbox_perturb_rejected,
+    build_method2_risk_perturb_rejected,
     build_prompt_branch_a,
     build_prompt_branch_b,
     build_rejected_trace_branch_ab,
@@ -156,6 +160,74 @@ class TestBranchABLogic(unittest.TestCase):
         self.assertIn("Step 1: There is a firearm visible.", out)
         self.assertIn("Step 2 & 3: I have the necessary information", out)
         self.assertIn("A harmful affirmative reply.", out)
+
+
+class TestPlausibleWrongFactor(unittest.TestCase):
+    def test_knife_maps_to_benign_similar(self):
+        rng = random.Random(42)
+        w = _plausible_wrong_factor("kitchen knife", rng)
+        self.assertNotEqual(w.strip().lower(), "kitchen knife")
+        self.assertTrue(any(x in w.lower() for x in ("butter", "plastic", "letter", "spatula")))
+
+
+class TestFormatBreak(unittest.TestCase):
+    def test_variant_mismatch_logic_closer(self):
+        # ``Random(2).randrange(8) == 0`` hits the mismatched ``</thinking>`` logic closer.
+        rng = random.Random(2)
+        out = build_format_break_rejected(M1_FULL_A, "method1", rng)
+        assert out is not None
+        self.assertIn("</thinking>", out)
+
+    def test_method2_typo_close_tag_branch(self):
+        # ``Random(5).randrange(8) == 4`` hits the spatial closing-tag typo variant.
+        rng = random.Random(5)
+        out = build_format_break_rejected(M2_FULL, "method2", rng)
+        assert out is not None
+        self.assertIn("with_boxess", out.replace(" ", "").lower())
+
+    def test_variant_plain_text_no_contract_tags(self):
+        # ``Random(0).randrange(8) == 6`` — prose only, no ``<risk_factors>`` / ``<logic>`` / ``<response>``.
+        rng = random.Random(0)
+        out = build_format_break_rejected(M1_FULL_A, "method1", rng)
+        assert out is not None
+        self.assertIn("Risk notes (unstructured):", out)
+        self.assertNotIn("<risk_factors>", out)
+        self.assertNotIn("<logic>", out)
+        self.assertNotIn("<response>", out)
+
+    def test_variant_stray_half_tags(self):
+        # ``Random(9).randrange(8) == 7`` — orphan closers + truncated open + pseudo markers.
+        rng = random.Random(9)
+        out = build_format_break_rejected(M1_FULL_A, "method1", rng)
+        assert out is not None
+        self.assertIn("</risk_factors>", out)
+        self.assertIn("<logi", out)
+        self.assertIn("[[RESPONSE]]", out)
+
+
+class TestRiskPerturb(unittest.TestCase):
+    def test_method1_preserves_logic_response(self):
+        rng = random.Random(0)
+        rej = build_method1_risk_perturb_rejected(M1_FULL_A, rng)
+        assert rej is not None
+        self.assertIn("<logic>", rej)
+        tail = M1_FULL_A[M1_FULL_A.index("<logic>") :]
+        self.assertEqual(
+            rej[rej.index("<logic>") :],
+            tail,
+        )
+
+    def test_method2_no_risk_injects_boxes(self):
+        trace = f"""<risk_factors_with_boxes>
+no risk
+</risk_factors_with_boxes>
+{M1_LOGIC_REFUSE}
+{M1_RESP_SORRY}"""
+        rng = random.Random(1)
+        rej = build_method2_risk_perturb_rejected(trace, rng)
+        assert rej is not None
+        self.assertNotIn("\nno risk\n</risk_factors_with_boxes>", rej.lower())
+        self.assertIn("phrase:", rej.lower())
 
 
 class TestMethod2BboxPerturb(unittest.TestCase):
