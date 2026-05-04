@@ -31,6 +31,12 @@ from train.dpo_trainer import VGSPVTrainer
 from train.dpo_yaml import DPOTrainConfig, default_dpo_config_path, dump_dpo_train_config_yaml, load_dpo_train_config, merge_dpo_train_config
 from train.lora_factory import attach_lora, default_lora_config
 from vlm import load_vlm, load_vlm_with_optional_lora
+from vlm.schema import LoadedVLM
+
+
+def _trl_processing_class(loaded: LoadedVLM) -> Any:
+    """TRL treats VLMs only if this is a ``ProcessorMixin``; tokenizer-only implies non-VLM."""
+    return loaded.processor if loaded.processor is not None else loaded.tokenizer
 
 
 def _str2bool(s: str) -> bool:
@@ -106,14 +112,15 @@ def _args_to_override_dict(ns: argparse.Namespace) -> dict[str, Any]:
 
 def _prepare_policy_and_ref(cfg: DPOTrainConfig, dtype: torch.dtype) -> tuple[Any, Any | None, Any]:
     """
-    Returns (policy_model, ref_model, tokenizer).
+    Returns (policy_model, ref_model, processing_class).
+
+    ``processing_class`` is an HF processor when the backend exposes one (required by TRL for
+    datasets with ``image`` columns); otherwise the tokenizer (e.g. TinyLLaVA tokenizer-only).
 
     Policy always uses LoRA: either continued from a merged bbox checkpoint, trainable
     bbox PEFT, or freshly attached DPO LoRA on the base VLM. Reference is a frozen
     copy of π_ref without the trainable DPO adapter (separate load when needed).
     """
-    tokenizer: Any
-
     if cfg.lora_adapter_path:
         loaded = load_vlm_with_optional_lora(
             cfg.model_name,
@@ -122,7 +129,7 @@ def _prepare_policy_and_ref(cfg: DPOTrainConfig, dtype: torch.dtype) -> tuple[An
             merge_adapter=cfg.merge_lora_adapter,
             is_trainable=True,
         )
-        tokenizer = loaded.tokenizer
+        proc = _trl_processing_class(loaded)
         inner = loaded.model
 
         if isinstance(inner, PeftModel) and not cfg.merge_lora_adapter:
@@ -133,13 +140,13 @@ def _prepare_policy_and_ref(cfg: DPOTrainConfig, dtype: torch.dtype) -> tuple[An
             ref_model = ref_loaded.model
             for p in ref_model.parameters():
                 p.requires_grad = False
-            return inner, ref_model, tokenizer
+            return inner, ref_model, proc
 
         for p in inner.parameters():
             p.requires_grad = False
         lcfg = default_lora_config(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
         policy = attach_lora(inner, lora_config=lcfg, freeze_vision=True, prepare_kbit=cfg.ref_8bit)
-        return policy, inner, tokenizer
+        return policy, inner, proc
 
     if cfg.ref_8bit:
         policy_loaded = load_vlm(cfg.model_name, dtype=dtype)
@@ -151,7 +158,7 @@ def _prepare_policy_and_ref(cfg: DPOTrainConfig, dtype: torch.dtype) -> tuple[An
         ref_model = ref_loaded.model
         for p in ref_model.parameters():
             p.requires_grad = False
-        tokenizer = policy_loaded.tokenizer
+        proc = _trl_processing_class(policy_loaded)
         lcfg = default_lora_config(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
         policy = attach_lora(
             policy_loaded.model,
@@ -159,16 +166,16 @@ def _prepare_policy_and_ref(cfg: DPOTrainConfig, dtype: torch.dtype) -> tuple[An
             freeze_vision=True,
             prepare_kbit=False,
         )
-        return policy, ref_model, tokenizer
+        return policy, ref_model, proc
 
     loaded = load_vlm(cfg.model_name, dtype=dtype)
     ref_model = loaded.model
     for p in ref_model.parameters():
         p.requires_grad = False
-    tokenizer = loaded.tokenizer
+    proc = _trl_processing_class(loaded)
     lcfg = default_lora_config(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
     policy = attach_lora(loaded.model, lora_config=lcfg, freeze_vision=True, prepare_kbit=False)
-    return policy, ref_model, tokenizer
+    return policy, ref_model, proc
 
 
 def main() -> None:
@@ -187,7 +194,7 @@ def main() -> None:
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
     dtype = torch.bfloat16 if cfg.bf16 else torch.float32
-    model, ref_model, tokenizer = _prepare_policy_and_ref(cfg, dtype)
+    model, ref_model, processing_class = _prepare_policy_and_ref(cfg, dtype)
 
     pi = cfg.prompt_instruction or DEFAULT_PROMPT_INSTRUCTION
     train_dataset = load_dpo_dataset(cfg.data_path, prompt_instruction=pi)
@@ -218,7 +225,7 @@ def main() -> None:
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        processing_class=tokenizer,
+        processing_class=processing_class,
         use_vgfdpo=cfg.use_vgfdpo,
         use_vdpo=cfg.use_vdpo,
         alpha_vdpo=cfg.alpha_vdpo,
