@@ -95,7 +95,7 @@ if [[ -n "${RESUME_ADAPTER_PATH}" ]]; then
   RESUME_ARGS=( --resume_adapter_path "${RESUME_ADAPTER_PATH}" )
 fi
 
-conda run -n vg-spv --no-capture-output python -u train/run_bounding_box_sft.py \
+conda run -p ~/scratch/envs/vg-spv --no-capture-output python -u train/run_bounding_box_sft.py \
   --model_name "${MODEL_NAME}" \
   --vgspv_csv "${VGSPV_CSV}" \
   --vgspv_eval_csv "${VGSPV_EVAL_CSV}" \
