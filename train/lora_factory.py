@@ -22,6 +22,21 @@ _DEFAULT_TARGETS = (
 )
 
 
+def normalize_no_split_modules_for_accelerate(model: Any) -> None:
+    """
+    PEFT ``load_adapter`` calls ``accelerate.utils.get_balanced_memory`` with
+    ``no_split_module_classes=model._no_split_modules``. Accelerate only coerces
+    non-list/tuple values by wrapping in a single-element list. If the value is a
+    ``set`` of class names, that becomes ``[set(...)]`` and ``set(no_split_module_classes)``
+    then raises ``TypeError: unhashable type: 'set'``. Some Transformers checkpoints
+    expose ``_no_split_modules`` as a set; normalize to an immutable sequence first.
+    """
+    for mod in model.modules():
+        nsm = getattr(mod, "_no_split_modules", None)
+        if isinstance(nsm, set):
+            mod._no_split_modules = tuple(nsm)
+
+
 def freeze_vision_parameters(model: Any) -> None:
     """Disable gradients for common vision encoder name patterns."""
     for name, p in model.named_parameters():

@@ -17,6 +17,11 @@ with PaDT at ``--vgspv_mix_fraction`` (default **0.25**). Default eval adds ``te
 (100 COCO HF + 100 VG-fDPO CSV by default, reproducible with ``--mix_seed``). Use ``--eval_no_balanced_subset``
 for the full concatenated eval sets. Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` for paths; ``--no_vgspv_csv``
 or ``--skip_eval`` to disable those sides.
+
+Checkpoints default to **not** saving the optimizer (``save_only_model``), which avoids huge
+``optimizer.pt`` writes that often hit disk quota on NFS/home. Use ``--save_optimizer_state`` only if
+you need full HF resume state. If a checkpoint write still fails, training continues and the LoRA
+bundle is mirrored to ``adapter_latest/`` when possible (``BoundingBoxSFTTrainer``).
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch
 from peft import PeftModel
-from transformers import Trainer, TrainerCallback
+from transformers import TrainerCallback
 
 from train.bounding_box_sft_collator import BoundingBoxSFTCollator
 from train.bounding_box_sft_dataset import load_bbox_sft_hf_datasets, load_vgspv_csv_rows_for_sft
@@ -41,8 +46,9 @@ from train.bounding_box_sft_eval_sampling import EVAL_BALANCE_SEED_OFFSET, subsa
 from train.bounding_box_sft_schema import BOX_COORD_SCALE
 from train.bounding_box_sft_torch_dataset import BoundingBoxSFTConcatEvalDataset, BoundingBoxSFTMixedIndexDataset
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION
+from train.bounding_box_sft_trainer import BoundingBoxSFTTrainer
 from train.hf_training_args_compat import apply_eval_scheduling_kwargs, instantiate_training_arguments
-from train.lora_factory import attach_lora, default_lora_config
+from train.lora_factory import attach_lora, default_lora_config, normalize_no_split_modules_for_accelerate
 from vlm import load_vlm
 
 _DEFAULT_MM_TRAIN_CSV = _REPO_ROOT / "data/mm-safebench_1/extracted_data/traces/train_method2.csv"
@@ -236,8 +242,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--save_total_limit",
         type=int,
-        default=2,
-        help="Max full checkpoints to keep under output_dir (oldest removed). adapter_latest is always overwritten.",
+        default=1,
+        help=(
+            "Max full checkpoints to keep under output_dir (oldest removed). "
+            "This script defaults to 1 to avoid accumulating large checkpoint folders. "
+            "adapter_latest is always overwritten."
+        ),
+    )
+    p.add_argument(
+        "--save_optimizer_state",
+        action="store_true",
+        help="Include optimizer/scheduler in HF checkpoints (large; can fill quota and fail mid-run). "
+        "Default is off: only model/adapter weights are checkpointed (see TrainingArguments.save_only_model).",
     )
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--max_steps", type=int, default=-1)
@@ -487,6 +503,7 @@ def main() -> None:
     )
 
     if args.resume_adapter_path:
+        normalize_no_split_modules_for_accelerate(loaded.model)
         model = PeftModel.from_pretrained(
             loaded.model,
             args.resume_adapter_path,
@@ -519,13 +536,18 @@ def main() -> None:
         warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps,
         save_strategy=save_strategy,
-        save_total_limit=max(1, int(args.save_total_limit)),
+        # Keep only the latest HF checkpoint folder to reduce disk churn.
+        # (We also mirror a crash-recovery PEFT bundle to adapter_latest/, which is overwritten.)
+        save_total_limit=1,
         bf16=args.bf16,
         fp16=not args.bf16 and dtype == torch.float16,
         max_steps=args.max_steps if args.max_steps > 0 else -1,
         remove_unused_columns=False,
         report_to="none",
         gradient_checkpointing=args.gradient_checkpointing,
+        # Skip optimizer/scheduler in HF checkpoints by default (saves disk; avoids torch.save failures).
+        save_only_model=not bool(args.save_optimizer_state),
+        save_safetensors=True,
     )
     # ``save_on_train_end`` exists only on newer ``transformers``; final PEFT is written after
     # ``trainer.train()`` anyway (``adapter/``, ``adapter_latest/`` + callbacks on_train_end).
@@ -541,6 +563,12 @@ def main() -> None:
         ):
             eval_dataset_arg = None
     targs = instantiate_training_arguments(**targs_kw)
+    if not args.save_optimizer_state:
+        print(
+            "[bbox_sft] HF step checkpoints: model/adapter only (optimizer not saved). "
+            "Use --save_optimizer_state for full HF state (large).",
+            flush=True,
+        )
 
     callbacks: list[TrainerCallback] = [
         SaveAdapterLatestCallback(adapter_latest, loaded.tokenizer, loaded.processor),
@@ -555,13 +583,17 @@ def main() -> None:
         )
         callbacks.append(epoch_cb)
 
-    trainer = Trainer(
+    trainer = BoundingBoxSFTTrainer(
         model=model,
         args=targs,
         train_dataset=torch_ds,
         eval_dataset=eval_dataset_arg,
         data_collator=collator,
         callbacks=callbacks,
+        tokenizer=loaded.tokenizer,
+        bbox_peft_save=_save_peft_bundle,
+        bbox_adapter_latest_dir=adapter_latest,
+        bbox_processor=loaded.processor,
     )
     if epoch_cb is not None:
         epoch_cb.set_trainer(trainer)
@@ -609,6 +641,8 @@ def main() -> None:
         "resume_adapter_path": args.resume_adapter_path,
         "save_every_steps": args.save_every_steps,
         "save_every_n_epochs": args.save_every_n_epochs,
+        "save_optimizer_state": bool(args.save_optimizer_state),
+        "save_only_model": not bool(args.save_optimizer_state),
         "lora": {"r": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout},
         "adapter_path": str(adapter_dir.resolve()),
         "adapter_latest_path": str(adapter_latest.resolve()),
