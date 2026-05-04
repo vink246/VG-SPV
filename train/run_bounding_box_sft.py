@@ -12,11 +12,13 @@ Requires: torch, transformers, peft, datasets, accelerate, pillow.
 
 Default HF REC source is **PaDT-MLLM/RefCOCO** (``--dataset_id``). When
 ``data/mm-safebench_1/extracted_data/traces/train_method2.csv`` exists, it is **mixed into training**
-with PaDT at ``--vgspv_mix_fraction`` (default **0.25**). Default eval adds ``test_method2.csv`` for
-``eval_loss``. When both HF eval and an eval CSV exist, validation uses a **fixed balanced subset**
-(100 COCO HF + 100 VG-fDPO CSV by default, reproducible with ``--mix_seed``). Use ``--eval_no_balanced_subset``
-for the full concatenated eval sets. Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` for paths; ``--no_vgspv_csv``
-or ``--skip_eval`` to disable those sides.
+with PaDT at ``--vgspv_mix_fraction`` (default **0.25**). With ``--vgspv_csv_supervised_only`` and a
+resolvable eval CSV (``--vgspv_eval_csv`` or default ``test_method2.csv``), **eval_loss uses the test
+CSV only** (PaDT val eval is skipped). Otherwise default eval adds ``test_method2.csv`` alongside HF
+eval; when both exist, validation may use a **balanced subset** (100+100 by default; use
+``--eval_no_balanced_subset`` for full concat). ``--eval_early_stopping_patience`` stops training after
+that many evals with no ``eval_loss`` improvement. Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` for paths;
+``--no_vgspv_csv`` or ``--skip_eval`` to disable those sides.
 
 Checkpoints default to **not** saving the optimizer (``save_only_model``), which avoids huge
 ``optimizer.pt`` writes that often hit disk quota on NFS/home. Use ``--save_optimizer_state`` only if
@@ -38,7 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch
 from peft import PeftModel
-from transformers import TrainerCallback
+from transformers import EarlyStoppingCallback, TrainerCallback
 
 from train.bounding_box_sft_collator import BoundingBoxSFTCollator
 from train.bounding_box_sft_dataset import load_bbox_sft_hf_datasets, load_vgspv_csv_rows_for_sft
@@ -305,6 +307,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Run eval every N steps (default: max(logging_steps, 50)). Ignored with --skip_eval.",
     )
+    p.add_argument(
+        "--eval_early_stopping_patience",
+        type=int,
+        default=0,
+        help="Stop training after this many eval runs without improvement in eval_loss (0 = disabled). "
+        "When > 0, enables load_best_model_at_end on eval_loss and aligns save_steps with eval_steps.",
+    )
     p.add_argument("--per_device_eval_batch_size", type=int, default=1)
     p.add_argument("--skip_eval", action="store_true", help="Disable eval loss (train loss only).")
     p.add_argument(
@@ -323,11 +332,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Train only on VG-SPV / Method-2 CSV rows (each step: CSV `prompt` + `chosen_reasoning_trace`). "
-            "Epoch length becomes len(train CSV). RefCOCO-style HF rows are not sampled for training "
-            "(HF data may still load for eval). Improves alignment with VG-fDPO prompts vs default PaDT mix."
+            "Epoch length becomes len(train CSV). RefCOCO-style HF rows are not sampled for training. "
+            "When a test/eval CSV is available (--vgspv_eval_csv or default test_method2.csv), validation "
+            "uses that CSV only (PaDT / HF val eval is skipped). Improves alignment with VG-fDPO prompts."
         ),
     )
     return p.parse_args()
+
+
+def _resolve_bbox_eval_csv_path(args: argparse.Namespace) -> Path | None:
+    """Eval CSV path if eval is enabled and a file exists; raises if --vgspv_eval_csv is set but missing."""
+    if args.skip_eval:
+        return None
+    if args.vgspv_eval_csv:
+        p = Path(args.vgspv_eval_csv).expanduser().resolve()
+        if not p.is_file():
+            raise SystemExit(f"--vgspv_eval_csv not found: {p}")
+        return p
+    if _DEFAULT_MM_EVAL_CSV.is_file():
+        return _DEFAULT_MM_EVAL_CSV.resolve()
+    return None
 
 
 def _try_load_hf_eval(
@@ -391,10 +415,21 @@ def main() -> None:
         image_root=args.bbox_hf_image_root,
     )
 
+    eval_csv_path = _resolve_bbox_eval_csv_path(args)
+    csv_supervised_test_csv_eval_only = bool(args.vgspv_csv_supervised_only and eval_csv_path is not None)
+
     hf_eval_ds = None
     eval_split_used: str | None = None
     hf_train = hf_train_full
-    if not args.skip_eval:
+    if not args.skip_eval and csv_supervised_test_csv_eval_only:
+        hf_eval_ds = None
+        hf_train = hf_train_full
+        eval_split_used = "vgspv_test_csv_only"
+        print(
+            f"[bbox_sft] CSV-supervised-only: skipping PaDT/HF eval; eval_loss uses test CSV only ({eval_csv_path}).",
+            flush=True,
+        )
+    elif not args.skip_eval:
         hf_eval_ds, eval_split_used = _try_load_hf_eval(
             sources,
             args.eval_split,
@@ -417,7 +452,7 @@ def main() -> None:
             print(f"HF eval: holdout {hold * 100:.3g}% of train rows (no hub val/validation/test).")
         else:
             print(f"HF eval: hub split {eval_split_used!r} ({len(hf_eval_ds)} rows).")
-        if args.eval_max_samples is not None and len(hf_eval_ds) > int(args.eval_max_samples):
+        if hf_eval_ds is not None and args.eval_max_samples is not None and len(hf_eval_ds) > int(args.eval_max_samples):
             hf_eval_ds = hf_eval_ds.select(range(int(args.eval_max_samples)))
             print(f"HF eval: capped pool to --eval_max_samples={int(args.eval_max_samples)} rows.")
     else:
@@ -457,18 +492,6 @@ def main() -> None:
             "(CSV `prompt` + `chosen_reasoning_trace`). PaDT rows are not sampled for training.",
             flush=True,
         )
-
-    eval_csv_path: Path | None = None
-    if args.skip_eval:
-        eval_csv_path = None
-    elif args.vgspv_eval_csv:
-        eval_csv_path = Path(args.vgspv_eval_csv).expanduser().resolve()
-        if not eval_csv_path.is_file():
-            raise SystemExit(f"--vgspv_eval_csv not found: {eval_csv_path}")
-    elif _DEFAULT_MM_EVAL_CSV.is_file():
-        eval_csv_path = _DEFAULT_MM_EVAL_CSV.resolve()
-    else:
-        eval_csv_path = None
 
     csv_eval_rows: list | None = None
     if eval_csv_path is not None:
@@ -575,15 +598,48 @@ def main() -> None:
     # ``trainer.train()`` anyway (``adapter/``, ``adapter_latest/`` + callbacks on_train_end).
     if save_strategy == "steps":
         targs_kw["save_steps"] = save_steps_val
+
     eval_dataset_arg = eval_ds if eval_ds is not None and len(eval_ds) > 0 else None
+    esp = max(0, int(args.eval_early_stopping_patience))
+    orig_save_strategy = save_strategy
+    orig_save_steps_val = save_steps_val
+
+    eval_steps_effective = int(args.eval_steps) if args.eval_steps is not None else max(int(args.logging_steps), 50)
+    eval_steps_effective = max(1, eval_steps_effective)
+
     if eval_dataset_arg is not None:
-        eval_steps = int(args.eval_steps) if args.eval_steps is not None else max(int(args.logging_steps), 50)
+        if esp > 0:
+            sync_steps = eval_steps_effective
+            if save_strategy == "steps" and args.save_every_steps and int(args.save_every_steps) > 0:
+                sync_steps = max(sync_steps, int(args.save_every_steps))
+            sync_steps = max(1, sync_steps)
+            eval_steps_effective = sync_steps
+            targs_kw["save_strategy"] = "steps"
+            targs_kw["save_steps"] = sync_steps
         if not apply_eval_scheduling_kwargs(
             targs_kw,
-            eval_steps=eval_steps,
+            eval_steps=eval_steps_effective,
             per_device_eval_batch_size=int(args.per_device_eval_batch_size),
         ):
             eval_dataset_arg = None
+            if esp > 0:
+                targs_kw["save_strategy"] = orig_save_strategy
+                if orig_save_strategy == "steps":
+                    targs_kw["save_steps"] = orig_save_steps_val
+                else:
+                    targs_kw.pop("save_steps", None)
+        elif esp > 0:
+            targs_kw["load_best_model_at_end"] = True
+            targs_kw["metric_for_best_model"] = "eval_loss"
+            targs_kw["greater_is_better"] = False
+            print(
+                f"[bbox_sft] Early stopping on eval_loss: patience={esp} evals; "
+                f"eval/save every {eval_steps_effective} steps; load_best_model_at_end.",
+                flush=True,
+            )
+
+    final_has_eval = eval_dataset_arg is not None
+
     targs = instantiate_training_arguments(**targs_kw)
     if not args.save_optimizer_state:
         print(
@@ -595,6 +651,8 @@ def main() -> None:
     callbacks: list[TrainerCallback] = [
         SaveAdapterLatestCallback(adapter_latest, loaded.tokenizer, loaded.processor),
     ]
+    if esp > 0 and eval_dataset_arg is not None:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=esp))
     epoch_cb: SaveEveryNEpochsCallback | None = None
     if args.save_every_n_epochs and int(args.save_every_n_epochs) > 0:
         epoch_cb = SaveEveryNEpochsCallback(
@@ -643,14 +701,13 @@ def main() -> None:
         "eval_balanced_subset": eval_balanced_meta,
         "eval_balanced_per_side": args.eval_balanced_per_side,
         "eval_no_balanced_subset": bool(args.eval_no_balanced_subset),
-        "eval_steps": (int(args.eval_steps) if args.eval_steps is not None else max(int(args.logging_steps), 50))
-        if eval_ds and len(eval_ds) > 0
-        else None,
-        "per_device_eval_batch_size": int(args.per_device_eval_batch_size)
-        if eval_ds and len(eval_ds) > 0
-        else None,
+        "eval_steps": eval_steps_effective if final_has_eval else None,
+        "eval_early_stopping_patience": esp,
+        "csv_supervised_test_csv_eval_only": csv_supervised_test_csv_eval_only,
+        "per_device_eval_batch_size": int(args.per_device_eval_batch_size) if final_has_eval else None,
         "skip_eval": bool(args.skip_eval),
         "eval_dataset_len": len(eval_ds) if eval_ds is not None else 0,
+        "eval_enabled_for_training": final_has_eval,
         "vgspv_train_csv": str(train_csv_path) if train_csv_path else None,
         "vgspv_csv": args.vgspv_csv,
         "vgspv_eval_csv": str(eval_csv_path) if eval_csv_path else None,

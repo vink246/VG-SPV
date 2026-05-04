@@ -2,12 +2,13 @@
 #SBATCH --job-name=bbox-sft
 #SBATCH --output=logs/bbox-sft-%j.out
 #SBATCH --error=logs/bbox-sft-%j.err
-#SBATCH --time=24:00:00
+#SBATCH --time=15:00:00
 #SBATCH --gres=gpu:1
+#SBATCH --constraint=A40|L40S|A100-40GB|A100-80GB|H100|H200
 #SBATCH -c 8
 #SBATCH --mem=64G
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=psomu3@gatech.edu
+#SBATCH --mail-user=%u@gatech.edu
 #
 # ============================================================================
 # Bounding-box SFT (LoRA) SLURM dispatcher.
@@ -20,6 +21,8 @@
 #   training code is configured to keep only the *latest* checkpoint folder
 #   (save_total_limit=1). The PEFT crash-recovery bundle is also written to
 #   OUTPUT_DIR/adapter_latest/ (overwritten each save).
+# - Default training mode matches Method-2 / VG-SPV CSV-only SFT (see knobs):
+#     --vgspv_csv … --vgspv_csv_supervised_only --max_samples 1
 # ============================================================================
 
 set -euo pipefail
@@ -39,7 +42,15 @@ MODEL_NAME="meta-llama/Llama-3.2-11B-Vision-Instruct"
 # Leave empty to start a fresh LoRA run.
 RESUME_ADAPTER_PATH=""
 
-OUTPUT_DIR="outputs/bbox_sft_run"
+OUTPUT_DIR="outputs/bbox_sft_llama"
+
+# Method-2 train CSV (MM-SafetyBench traces). Use --vgspv_csv_supervised_only so each epoch
+# walks this CSV only (PaDT not sampled for train); --max_samples 1 caps HF train load size.
+VGSPV_CSV="data/mm-safebench_1/extracted_data/traces/train_method2.csv"
+VGSPV_EVAL_CSV="data/mm-safebench_1/extracted_data/traces/test_method2.csv"
+MAX_HF_TRAIN_SAMPLES=1
+# Stop if eval_loss does not improve for this many consecutive eval runs (0 = off).
+EVAL_EARLY_STOPPING_PATIENCE=3
 
 # Checkpoint cadence (0 disables). Only the latest folder is kept.
 SAVE_EVERY_STEPS=200
@@ -65,6 +76,10 @@ echo "PWD          : $(pwd)"
 echo "PYTHON       : $(which python) ($(python --version 2>&1))"
 echo "MODEL_NAME   : ${MODEL_NAME}"
 echo "OUTPUT_DIR   : ${OUTPUT_DIR}"
+echo "VGSPV_CSV    : ${VGSPV_CSV}"
+echo "VGSPV_EVAL   : ${VGSPV_EVAL_CSV}"
+echo "EVAL_ES_PAT  : ${EVAL_EARLY_STOPPING_PATIENCE}"
+echo "CSV_ONLY     : vgspv_csv_supervised_only + max_samples=${MAX_HF_TRAIN_SAMPLES}"
 echo "RESUME       : ${RESUME_ADAPTER_PATH:-<none>}"
 echo "SAVE_STEPS   : ${SAVE_EVERY_STEPS}"
 echo "================="
@@ -82,6 +97,11 @@ fi
 
 conda run -n vg-spv --no-capture-output python -u train/run_bounding_box_sft.py \
   --model_name "${MODEL_NAME}" \
+  --vgspv_csv "${VGSPV_CSV}" \
+  --vgspv_eval_csv "${VGSPV_EVAL_CSV}" \
+  --vgspv_csv_supervised_only \
+  --max_samples "${MAX_HF_TRAIN_SAMPLES}" \
+  --eval_early_stopping_patience "${EVAL_EARLY_STOPPING_PATIENCE}" \
   --output_dir "${OUTPUT_DIR}" \
   --epochs "${EPOCHS}" \
   --per_device_train_batch_size "${PER_DEVICE_TRAIN_BS}" \
