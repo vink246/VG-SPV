@@ -234,11 +234,37 @@ Do this once:
    python scripts/download_bounding_box_sft_datasets.py --dataset_id PaDT-MLLM/RefCOCO --split train
    ```
 
-2. **MSCOCO pixels** — from [cocodataset.org](https://cocodataset.org/#download), download **2014 Train images** (`train2014.zip`), unzip so you have:
+2. **MSCOCO 2014 under `data/coco`** — PaDT filenames match the **2014** image release. From the **VG-SPV repo root**, run:
 
-   `data/coco/train2014/COCO_train2014_000000xxxxxx.jpg` (same layout as the official zip; repo root = VG-SPV root).
+   ```bash
+   mkdir -p data/coco
+   cd data/coco
 
-   Add **2014 Val** (`val2014.zip`) if you need val-style `COCO_val2014_*.jpg` rows. The loader also tries `train2017/` / `val2017/` as a second choice for the same basename if you mirror files there.
+   # Download images
+   wget -c http://images.cocodataset.org/zips/train2014.zip
+   wget -c http://images.cocodataset.org/zips/val2014.zip
+
+   # Download annotations (optional for bbox SFT image loading; keep if you use COCO JSON elsewhere)
+   wget -c http://images.cocodataset.org/annotations/annotations_trainval2014.zip
+
+   # Extract (archives already contain train2014/ and val2014/ top-level folders)
+   unzip -q train2014.zip
+   unzip -q val2014.zip
+   unzip -q annotations_trainval2014.zip
+
+   # Clean up zip files
+   rm -f train2014.zip val2014.zip annotations_trainval2014.zip
+
+   cd ../..
+   ```
+
+   Expected layout (what the trainer resolves):
+
+   - `data/coco/train2014/COCO_train2014_*.jpg`
+   - `data/coco/val2014/COCO_val2014_*.jpg`
+   - `data/coco/annotations/` — JSON from the annotations zip (not required for opening PaDT rows)
+
+   Official index: [cocodataset.org/#download](https://cocodataset.org/#download). The loader also tries `train2017/` / `val2017/` after `train2014` / `val2014` if you mirror basenames there.
 
 3. **Check** (from repo root, after step 1–2):
 
