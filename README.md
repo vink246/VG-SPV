@@ -207,11 +207,33 @@ Training data is stored as **CSV** files with the following columns (headers may
 - LLaVA-v1.6-Mistral-7B class: e.g. `llava-hf/llava-v1.6-mistral-7b-hf` (matches [`configs/dpo.yaml`](configs/dpo.yaml) and `train/run_bounding_box_sft.py` defaults).
 - Llama-3.2-11B-Vision-Instruct: `meta-llama/Llama-3.2-11B-Vision-Instruct` (gated; set a Hugging Face token with access).
 
-**Datasets (Shikra / VoCoT-style REC):**
+### Train loss vs eval loss during SFT
 
-- **Training (default):** [`PaDT-MLLM/RefCOCO`](https://huggingface.co/datasets/PaDT-MLLM/RefCOCO) — preprocessed RefCOCO with a `train` split (VoCoT / PaDT line of work; large referring-expression corpus).
-- **Evaluation (default):** [`lmms-lab/RefCOCO`](https://huggingface.co/datasets/lmms-lab/RefCOCO) — `val` split (lmms-eval style; no `train` on this hub).
-- **More REC data:** Shikra and VoCoT also leverage **RefCOCO+** and **RefCOCOg**; PaDT hosts companion hubs under the [`PaDT-MLLM` organization](https://huggingface.co/PaDT-MLLM). The downloader preset `eval_rec` touches `lmms-lab/RefCOCO`, `lmms-lab/RefCOCOplus`, and `lmms-lab/RefCOCOg` validation splits.
+- **Train loss (`loss`):** Hugging Face `Trainer` logs the running training loss every **`--logging_steps`** (default **20**) to the console.
+- **Eval loss (`eval_loss`):** When an eval set is built (default on), the trainer runs **`evaluation_strategy="steps"`** every **`--eval_steps`** (default **`max(logging_steps, 50)`**) over a combined eval set (see below). Logs include **`eval_loss`** alongside **`loss`**. Disable all eval with **`--skip_eval`** (train loss only).
+
+### HF REC data (RefCOCO family)
+
+- **Training HF rows:** Loaded from **`--split`** (default **`train`**) for **`--dataset_id`** plus any **`--extra_dataset`** entries; multiple sources are **concatenated** when their schemas are compatible (`train/bounding_box_sft_dataset.py::load_bbox_sft_hf_datasets`). Cap training rows with **`--max_samples`** for debugging.
+- **Eval HF rows (for `eval_loss`):** The script tries, in order, **`--eval_split`** (default **`val`**), then **`validation`**, then **`test`**. If none of those splits load or they are empty, it **holds out** **`--hf_eval_holdout_fraction`** (default **0.02**) of the **loaded train HF** split into a disjoint eval shard (train HF is then the remainder). Cap eval HF rows after loading with **`--eval_max_samples`**.
+- **Hub vs local disk:** A **`--dataset_id`** or **`--extra_dataset`** value that is an existing directory is loaded with **`datasets.load_from_disk`** (must be a dataset saved with `Dataset.save_to_disk` / `DatasetDict.save_to_disk`). Hub ids use **`datasets.load_dataset`**. For **offline / PACE** cache mirrors, point **`HF_HOME`** (or related HF env vars) at scratch and pass **`--hf_local_files_only`** so hub loads do not hit the network.
+- **More REC data:** PaDT hosts RefCOCO / RefCOCO+ / RefCOCOg under [`PaDT-MLLM`](https://huggingface.co/PaDT-MLLM); lmms-lab hubs expose **`val`** splits for IoU eval (`eval/run_bounding_box_sft_eval.py`). The downloader [`scripts/download_bounding_box_sft_datasets.py`](scripts/download_bounding_box_sft_datasets.py) presets **`train_rec`** / **`eval_rec`** warm the cache.
+
+### MM-SafetyBench Method 2 CSVs (VG-SPV traces)
+
+If these files exist **under the repo root**, they are picked up **automatically** (no need to pass paths unless you want overrides):
+
+| Role | Default path (if the file exists) |
+|------|-------------------------------------|
+| **Mixed into training** | `data/mm-safebench_1/extracted_data/traces/train_method2.csv` |
+| **Included only in eval** | `data/mm-safebench_1/extracted_data/traces/test_method2.csv` |
+
+- **`--vgspv_mix_fraction`** (default **0.25**): fraction of **training** steps that sample from the **train** VG-SPV CSV vs the **train** HF dataset (deterministic per index via **`--mix_seed`**). Ignored if no train CSV is loaded.
+- **`--no_vgspv_csv`:** Never mix `train_method2.csv`, even if it exists.
+- **`--vgspv_csv` / `--vgspv_eval_csv`:** Explicit paths override the defaults above. The eval CSV is only used when eval is enabled (not **`--skip_eval`**).
+- **Columns:** `load_vgspv_csv_rows_for_sft` requires **`image`** and **`chosen_reasoning_trace`**. If a **`prompt`** column is present, it is used as the **user** text for that row; otherwise **`--vgspv_prompt_instruction`** (or `train/dataset_adapter.py::DEFAULT_PROMPT_INSTRUCTION`) is used. Relative **`image`** paths are resolved against the repo root, cwd, and optional **`--vgspv_image_root`**.
+
+The **eval dataset** is one pass over **all HF eval rows** followed by **all eval CSV rows** (`train/bounding_box_sft_torch_dataset.py::BoundingBoxSFTConcatEvalDataset`). The collator routes **train** vs **eval** pools (`train/bounding_box_sft_collator.py`).
 
 **1) Cache datasets (downloads into the HF datasets cache):**
 
@@ -227,8 +249,11 @@ python scripts/download_bounding_box_sft_datasets.py --dataset_id PaDT-MLLM/RefC
 ```bash
 # Linux / macOS — optional env vars; extra CLI args are forwarded (see scripts/run_bounding_box_sft.sh)
 MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct OUTPUT_DIR=outputs/bbox_sft_llama bash scripts/run_bounding_box_sft.sh
-# e.g. pass HF dataset overrides or CSV mix:
-# MODEL_NAME=... bash scripts/run_bounding_box_sft.sh --dataset_config refcoco --vgspv_csv data/your.csv --vgspv_mix_fraction 0.15
+# Example: extra PaDT hubs + offline hub cache on a cluster:
+# export HF_HOME=$SCRATCH/huggingface
+# MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct bash scripts/run_bounding_box_sft.sh \
+#   --hf_local_files_only --dataset_config refcoco \
+#   --extra_dataset PaDT-MLLM/RefCOCOPlus --extra_dataset PaDT-MLLM/RefCOCOg
 
 # Or invoke Python directly (Windows-friendly)
 python train/run_bounding_box_sft.py ^
@@ -236,9 +261,11 @@ python train/run_bounding_box_sft.py ^
   --dataset_id PaDT-MLLM/RefCOCO --split train ^
   --output_dir outputs/bbox_sft_llava --bf16 --gradient_checkpointing
 
-# Optional: mix VG-fDPO CSV rows (same schema as DPO: image + chosen_reasoning_trace) for safety-style supervision
+# Explicit MM-SafetyBench paths and mix (same as defaults when those files exist under the repo)
 python train/run_bounding_box_sft.py --model_name meta-llama/Llama-3.2-11B-Vision-Instruct ^
-  --vgspv_csv data/sample_dpo_data.csv --vgspv_mix_fraction 0.2 --save_every_steps 200
+  --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv ^
+  --vgspv_eval_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv ^
+  --vgspv_mix_fraction 0.25 --save_every_steps 200 --bf16 --gradient_checkpointing
 
 # Resume LoRA training from a saved adapter (base must match --model_name)
 python train/run_bounding_box_sft.py --model_name llava-hf/llava-v1.6-mistral-7b-hf ^
@@ -250,8 +277,9 @@ Full flag reference (`python train/run_bounding_box_sft.py --help` is authoritat
 | Area | Flags |
 |------|--------|
 | Model | **`--model_name`** (required), **`--model_family`** (`qwen3_vl`, `llava`, `mllama`, `tinyllava` — bbox SFT collator rejects TinyLLaVA today), **`--bf16`**, **`--gradient_checkpointing`** |
-| HF REC data | **`--dataset_id`**, **`--dataset_config`**, **`--split`**, **`--max_samples`** (cap rows for debugging) |
-| VG-SPV CSV mix | **`--vgspv_csv`**, **`--vgspv_mix_fraction`** (must be positive when CSV is set), **`--vgspv_prompt_instruction`**, **`--mix_seed`** (deterministic HF vs CSV per index). CSV **`image`** paths must be absolute or relative to the **working directory** when you launch training. |
+| HF REC data | **`--dataset_id`**, **`--extra_dataset`** (repeatable hub id or `save_to_disk` path), **`--dataset_config`**, **`--split`** (train HF), **`--max_samples`**, **`--hf_local_files_only`** |
+| Eval (HF + `eval_loss`) | **`--eval_split`**, **`--hf_eval_holdout_fraction`** (if no hub val), **`--eval_max_samples`**, **`--eval_steps`**, **`--per_device_eval_batch_size`**, **`--skip_eval`** |
+| VG-SPV CSV | **`--vgspv_csv`**, **`--vgspv_eval_csv`**, **`--vgspv_mix_fraction`**, **`--no_vgspv_csv`**, **`--vgspv_prompt_instruction`**, **`--vgspv_image_root`**, **`--mix_seed`** |
 | Resume | **`--resume_adapter_path`** — PEFT dir (`adapter/` or `adapter_latest/`); skips fresh LoRA init |
 | Checkpoints | **`--save_every_steps`** (default 500; **`0`** = no step checkpoints), **`--save_every_n_epochs`** (0 = off), **`--save_total_limit`** (rolling HF checkpoints under `output_dir`) — each step/epoch save also refreshes **`adapter_latest/`** |
 | Training | **`--epochs`**, **`--learning_rate`**, **`--per_device_train_batch_size`**, **`--gradient_accumulation_steps`**, **`--logging_steps`**, **`--warmup_ratio`**, **`--max_steps`** (positive value caps training by global steps instead of epochs) |
@@ -264,7 +292,7 @@ Artifacts:
 
 - **`outputs/.../adapter/`** — final PEFT adapter + tokenizer/processor (pass to `inference/run_inference.py --lora-adapter` or `train/run_dpo.py --lora_adapter_path`).
 - **`outputs/.../adapter_latest/`** — last successful periodic save (overwritten each time).
-- **`outputs/.../bounding_box_sft_meta.json`** — base model id, dataset id, mix/resume/save settings, LoRA hyperparameters.
+- **`outputs/.../bounding_box_sft_meta.json`** — base model id, **dataset source list**, train/eval split names, eval length, VG-SPV CSV paths, mix/resume/save settings, LoRA hyperparameters, and related eval flags.
 
 **3) Evaluate IoU on a RefCOCO split:**
 
@@ -379,13 +407,16 @@ phrase: "knife" | box: [0400, 0600, 0800, 0900]
 
 **Trainer integration:**
 
-- The CSVs are **SFT-ready today** as drop-in `--vgspv_csv` inputs for `train/run_bounding_box_sft.py` (only `image` + `chosen_reasoning_trace` are required by `train/bounding_box_sft_dataset.py::load_vgspv_csv_rows_for_sft`):
+- The Method 2 CSVs are **SFT-ready** for `train/run_bounding_box_sft.py`. **`train_method2.csv`** is mixed into **training** (with RefCOCO-style HF data); **`test_method2.csv`** is included in the **eval** pass for **`eval_loss`** when that file exists under the repo (see **Bounding-box SFT (LoRA)** earlier in this README). Only **`image`** + **`chosen_reasoning_trace`** are required by `train/bounding_box_sft_dataset.py::load_vgspv_csv_rows_for_sft`; use the **`prompt`** column for per-row user text when present.
 
   ```bash
   python -m train.run_bounding_box_sft --model_name llava-hf/llava-v1.6-mistral-7b-hf \
-    --vgspv_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv \
-    --vgspv_mix_fraction 0.3 --bf16
+    --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv \
+    --vgspv_eval_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv \
+    --vgspv_mix_fraction 0.25 --bf16 --gradient_checkpointing
   ```
+
+  If both CSVs live at the default paths under the repo, you can omit **`--vgspv_csv`** / **`--vgspv_eval_csv`** and the trainer will pick them up automatically.
 
 - The CSVs become **DPO-ready** when `rejected_reasoning_trace` is filled. Use [`scripts/generate_rejected_traces.py`](scripts/generate_rejected_traces.py) (abliterated LM branch + optional **Method 2** bbox coordinate corruption), for example:
 
