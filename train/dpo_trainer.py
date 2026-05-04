@@ -17,11 +17,17 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from transformers import ProcessorMixin
+
+# TRL is lazy-loaded; use real DPOTrainer only. A stub base breaks ``super().__init__``
+# (object.__init__ rejects kwargs) and surfaces as confusing runtime errors on clusters.
 try:
     from trl import DPOTrainer
-except Exception:  # pragma: no cover - allows importing helpers in lightweight test envs
-    class DPOTrainer:  # type: ignore[override]
-        pass
+except ImportError:  # pragma: no cover - alternate layouts across trl versions
+    try:
+        from trl.trainer import DPOTrainer
+    except ImportError:
+        from trl.trainer.dpo_trainer import DPOTrainer
 
 from train.tag_parsing import iou_xyxy_norm, parse_first_norm_box
 
@@ -101,8 +107,23 @@ class VGSPVTrainer(DPOTrainer):
             raise ValueError(f"Unsupported grounding_mode: {self.grounding_mode}")
         self._tag_ids = self._build_tag_ids()
 
+    def _trl_encoding_tokenizer(self) -> Any:
+        """TRL stores text tokenizer as ``_tokenizer``; HF Trainer uses ``processing_class``."""
+        inner = getattr(self, "_tokenizer", None)
+        if inner is not None:
+            return inner
+        legacy = getattr(self, "tokenizer", None)
+        if legacy is not None:
+            return legacy
+        pc = getattr(self, "processing_class", None)
+        if pc is None:
+            raise RuntimeError("VGSPVTrainer: no tokenizer (expected TRL _tokenizer or processing_class).")
+        if isinstance(pc, ProcessorMixin):
+            return pc.tokenizer
+        return pc
+
     def _build_tag_ids(self) -> dict[str, list[int]]:
-        tok = self.tokenizer
+        tok = self._trl_encoding_tokenizer()
         out: dict[str, list[int]] = {}
         for t in _RISK_TAGS + (_LOGIC_TAG, _RESPONSE_TAG):
             out[f"<{t}>"] = tok.encode(f"<{t}>", add_special_tokens=False)
@@ -154,7 +175,7 @@ class VGSPVTrainer(DPOTrainer):
         if len(tokens) == 0 or int(mask.sum().item()) == 0:
             return ""
         ids = [t for t, keep in zip(tokens, mask.tolist()) if keep]
-        return self.tokenizer.decode(ids, skip_special_tokens=False)
+        return self._trl_encoding_tokenizer().decode(ids, skip_special_tokens=False)
 
     def _sample_spans(self, labels_row: torch.Tensor) -> _SampleSpans:
         valid = labels_row[1:] != -100

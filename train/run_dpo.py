@@ -218,7 +218,7 @@ def main() -> None:
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         use_vgfdpo=cfg.use_vgfdpo,
         use_vdpo=cfg.use_vdpo,
         alpha_vdpo=cfg.alpha_vdpo,
