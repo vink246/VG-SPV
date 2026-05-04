@@ -50,7 +50,8 @@ def parse_args() -> argparse.Namespace:
         p.add_argument(f"--{name.replace('_', '-')}", type=t, default=None, help=help)
 
     add("model_name", str, "HF model id or local path")
-    add("data_path", str, "DPO dataset CSV / dir / HF id")
+    add("data_path", str, "Train split: DPO dataset CSV / dir / HF id")
+    add("eval_data_path", str, "Eval/test split CSV / dir / HF id (optional; eval each epoch when set)")
     add("output_dir", str, "Training output directory")
     add("prompt_instruction", str, "Prompt text when loading from CSV")
     add("num_train_epochs", int, "")
@@ -189,15 +190,18 @@ def main() -> None:
     dtype = torch.bfloat16 if cfg.bf16 else torch.float32
     model, ref_model, tokenizer = _prepare_policy_and_ref(cfg, dtype)
 
-    train_dataset = load_dpo_dataset(
-        cfg.data_path,
-        prompt_instruction=cfg.prompt_instruction or DEFAULT_PROMPT_INSTRUCTION,
-    )
+    pi = cfg.prompt_instruction or DEFAULT_PROMPT_INSTRUCTION
+    train_dataset = load_dpo_dataset(cfg.data_path, prompt_instruction=pi)
+
+    eval_dataset = None
+    if cfg.eval_data_path:
+        eval_dataset = load_dpo_dataset(cfg.eval_data_path, prompt_instruction=pi)
 
     training_args = DPOConfig(
         output_dir=cfg.output_dir,
         num_train_epochs=cfg.num_train_epochs,
         per_device_train_batch_size=cfg.per_device_train_batch_size,
+        per_device_eval_batch_size=cfg.per_device_train_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         max_length=cfg.max_length,
@@ -207,6 +211,7 @@ def main() -> None:
         logging_steps=cfg.logging_steps,
         save_steps=cfg.save_steps,
         save_total_limit=cfg.save_total_limit,
+        eval_strategy="epoch" if eval_dataset is not None else "no",
     )
 
     trainer = VGSPVTrainer(
@@ -214,6 +219,7 @@ def main() -> None:
         ref_model=ref_model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         use_vgfdpo=cfg.use_vgfdpo,
         use_vdpo=cfg.use_vdpo,

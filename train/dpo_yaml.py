@@ -19,15 +19,18 @@ class DPOTrainConfig:
 
     model_name: str = "llava-hf/llava-v1.6-mistral-7b-hf"
     data_path: str | None = None
+    # Optional CSV / HF id for evaluation (e.g. test split). When set, Trainer runs eval each epoch.
+    eval_data_path: str | None = None
     output_dir: str = "outputs/dpo"
     prompt_instruction: str | None = None
 
     num_train_epochs: int = 1
-    per_device_train_batch_size: int = 1
+    per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 8
     learning_rate: float = 5e-5
-    max_length: int = 1024
-    max_prompt_length: int = 512
+    # Cap full sequence length for DPO (chosen/rejected completions); raise if long XML traces truncate.
+    max_length: int = 8192
+    max_prompt_length: int = 2048
     beta: float = 0.1
     bf16: bool = True
     ref_8bit: bool = False
