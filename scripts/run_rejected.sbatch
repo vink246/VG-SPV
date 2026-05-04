@@ -7,7 +7,7 @@
 #SBATCH -c 8
 #SBATCH --mem=32G
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=psomu3@gatech.edu
+#SBATCH --mail-user=%u@gatech.edu
 
 
 set -euo pipefail
