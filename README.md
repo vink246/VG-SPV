@@ -287,7 +287,7 @@ Do this once:
      --vgspv_mix_fraction 0.25
    ```
 
-   Use **`--no_vgspv_csv`** for PaDT-only training. Tune **`--vgspv_mix_fraction`** toward `1.0` for more CSV-heavy training.
+   Use **`--no_vgspv_csv`** for PaDT-only training. Tune **`--vgspv_mix_fraction`** toward `1.0` for more CSV-heavy training (each epoch length is still PaDT-sized; every step samples CSV). For **strict** alignment with Method-2 prompts + traces, use **`--vgspv_csv_supervised_only`** instead.
 
 **Offline compute nodes:** set `HF_HOME` (or `HF_DATASETS_CACHE`) to the machine where you ran step 1, then add **`--hf_local_files_only`**. You do **not** need other Hub REC datasets if PaDT `train` plus a small **train holdout** for eval is enough (the trainer falls back to `--hf_eval_holdout_fraction` when hub `val`/`test` is missing or empty).
 
@@ -301,6 +301,7 @@ If these files exist **under the repo root**, they are picked up **automatically
 | **Included only in eval** | `data/mm-safebench_1/extracted_data/traces/test_method2.csv` |
 
 - **`--vgspv_mix_fraction`** (default **0.25**): fraction of **training** steps that sample from the **train** VG-SPV CSV vs the **train** HF dataset (deterministic per index via **`--mix_seed`**). Ignored if no train CSV is loaded.
+- **`--vgspv_csv_supervised_only`:** Train **only** on the Method-2 / VG-SPV train CSV: each step uses the row’s **`prompt`** and **`chosen_reasoning_trace`** (same contract as VG-fDPO), and **one epoch = one full pass over the CSV** (PaDT is not sampled for training; HF may still load for eval). Use this when you care more about matching **`train_method2.csv`** structure at inference than about RefCOCO-style referring-expression prompts. For faster startup when PaDT is unused for training, pass **`--max_samples 1`** (or another small cap) on the HF train load so the hub dataset is tiny.
 - **`--no_vgspv_csv`:** Never mix `train_method2.csv`, even if it exists.
 - **`--vgspv_csv` / `--vgspv_eval_csv`:** Explicit paths override the defaults above. The eval CSV is only used when eval is enabled (not **`--skip_eval`**).
 - **Columns:** `load_vgspv_csv_rows_for_sft` requires **`image`** and **`chosen_reasoning_trace`**. If a **`prompt`** column is present, it is used as the **user** text for that row; otherwise **`--vgspv_prompt_instruction`** (or `train/dataset_adapter.py::DEFAULT_PROMPT_INSTRUCTION`) is used. Relative **`image`** paths are resolved against the repo root, cwd, and optional **`--vgspv_image_root`**.
@@ -354,7 +355,7 @@ Full flag reference (`python train/run_bounding_box_sft.py --help` is authoritat
 | Model | **`--model_name`** (required), **`--model_family`** (`qwen3_vl`, `llava`, `mllama`, `tinyllava` — bbox SFT collator rejects TinyLLaVA today), **`--bf16`**, **`--gradient_checkpointing`** |
 | HF REC data | **`--dataset_id`**, **`--extra_dataset`** (repeatable hub id or `save_to_disk` path), **`--dataset_config`**, **`--split`** (train HF), **`--max_samples`**, **`--hf_local_files_only`**, **`--bbox_hf_image_root`** (COCO root; default `data/coco` when present) |
 | Eval (HF + `eval_loss`) | **`--eval_split`**, **`--hf_eval_holdout_fraction`** (if no hub val), **`--eval_max_samples`**, **`--eval_steps`**, **`--per_device_eval_batch_size`**, **`--skip_eval`** |
-| VG-SPV CSV | **`--vgspv_csv`**, **`--vgspv_eval_csv`**, **`--vgspv_mix_fraction`**, **`--no_vgspv_csv`**, **`--vgspv_prompt_instruction`**, **`--vgspv_image_root`**, **`--mix_seed`** |
+| VG-SPV CSV | **`--vgspv_csv`**, **`--vgspv_eval_csv`**, **`--vgspv_mix_fraction`**, **`--vgspv_csv_supervised_only`**, **`--no_vgspv_csv`**, **`--vgspv_prompt_instruction`**, **`--vgspv_image_root`**, **`--mix_seed`** |
 | Resume | **`--resume_adapter_path`** — PEFT dir (`adapter/` or `adapter_latest/`); skips fresh LoRA init |
 | Checkpoints | **`--save_every_steps`** (default 500; **`0`** = no step checkpoints), **`--save_every_n_epochs`** (0 = off), **`--save_total_limit`** (rolling HF checkpoints under `output_dir`) — each step/epoch save also refreshes **`adapter_latest/`** |
 | Training | **`--epochs`**, **`--learning_rate`**, **`--per_device_train_batch_size`**, **`--gradient_accumulation_steps`**, **`--logging_steps`**, **`--warmup_ratio`**, **`--max_steps`** (positive value caps training by global steps instead of epochs) |

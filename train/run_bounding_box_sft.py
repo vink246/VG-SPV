@@ -318,6 +318,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not mix train_method2.csv even if the default file exists.",
     )
+    p.add_argument(
+        "--vgspv_csv_supervised_only",
+        action="store_true",
+        help=(
+            "Train only on VG-SPV / Method-2 CSV rows (each step: CSV `prompt` + `chosen_reasoning_trace`). "
+            "Epoch length becomes len(train CSV). RefCOCO-style HF rows are not sampled for training "
+            "(HF data may still load for eval). Improves alignment with VG-fDPO prompts vs default PaDT mix."
+        ),
+    )
     return p.parse_args()
 
 
@@ -434,8 +443,20 @@ def main() -> None:
     if train_csv_path is not None:
         csv_rows = load_vgspv_csv_rows_for_sft(str(train_csv_path), image_root=img_root)
         mix_fraction = float(args.vgspv_mix_fraction)
-        if mix_fraction <= 0.0:
+        if not args.vgspv_csv_supervised_only and mix_fraction <= 0.0:
             raise SystemExit("Train VG-SPV CSV is loaded but --vgspv_mix_fraction must be > 0.")
+
+    if args.vgspv_csv_supervised_only:
+        if not csv_rows:
+            raise SystemExit(
+                "--vgspv_csv_supervised_only requires a train CSV (default train_method2.csv when present, "
+                "or --vgspv_csv). Do not combine with --no_vgspv_csv."
+            )
+        print(
+            f"[bbox_sft] CSV-supervised-only: {len(csv_rows)} steps/epoch on Method-2 / VG-SPV rows "
+            "(CSV `prompt` + `chosen_reasoning_trace`). PaDT rows are not sampled for training.",
+            flush=True,
+        )
 
     eval_csv_path: Path | None = None
     if args.skip_eval:
@@ -500,6 +521,7 @@ def main() -> None:
         csv_rows,
         mix_fraction=mix_fraction if csv_rows else 0.0,
         seed=args.mix_seed,
+        csv_supervised_only=bool(args.vgspv_csv_supervised_only),
     )
 
     if args.resume_adapter_path:
@@ -633,6 +655,7 @@ def main() -> None:
         "vgspv_csv": args.vgspv_csv,
         "vgspv_eval_csv": str(eval_csv_path) if eval_csv_path else None,
         "vgspv_mix_fraction": mix_fraction if csv_rows else 0.0,
+        "vgspv_csv_supervised_only": bool(args.vgspv_csv_supervised_only),
         "vgspv_prompt_instruction": vgspv_prompt if csv_rows else None,
         "vgspv_image_root": str(img_root) if img_root else None,
         "bbox_hf_image_root": args.bbox_hf_image_root,
