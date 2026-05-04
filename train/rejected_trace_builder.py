@@ -569,13 +569,13 @@ def build_format_break_rejected(chosen_trace: str, method: MethodTag, rng: rando
     if variant == 0:
         return (
             f"{risk_block}\n"
-            f"<logic>\n{logic_inner}\n</thinking>\n"
-            f"<response>\n{response_inner}\n</response>"
+            f"<thinking>\n{logic_inner}\n</thinking>\n"
+            f"<final_answer>\n{response_inner}\n</final_answer>"
         ).strip()
     if variant == 1:
         return (
             f"{risk_block}\n"
-            f"<logic>\n{logic_inner}\n</logic>\n"
+            f"\n{logic_inner}\n</logic>\n"
             f"<response>\n{response_inner}"
         ).strip()
     if variant == 2:
@@ -589,38 +589,27 @@ def build_format_break_rejected(chosen_trace: str, method: MethodTag, rng: rando
             f"<response>\n{response_inner}\n</response>"
         ).strip()
     if variant == 3:
-        # Unclosed ``<logic>`` so ``<response>`` appears inside the logic region (parse fail).
         return (
             f"{risk_block}\n"
-            f"<logic>\n{logic_inner}\n"
-            f"<response>\n{response_inner}\n</response>"
+            f"\n{logic_inner}\n"
+            f"\n{response_inner}\n"
         ).strip()
     if variant == 4:
-        if method == "method2":
-            bad_risk = risk_block.replace(
-                f"</{TAG_RISK_WITH_BOXES}>",
-                f"</{TAG_RISK_WITH_BOXES}s>",
-                1,
-            )
-            risk_header = bad_risk
-        else:
-            risk_header = f"Here is my analysis:\n{risk_block}"
         return (
-            f"{risk_header}\n"
-            f"<logic>\n{logic_inner}\n</logic>\n"
-            f"<response>\n{response_inner}\n</response>"
+            f"Here is my analysis:\n{risk_block}\n"
+            f"Here's the logic: <logic>\n{logic_inner}\n</logic>\n"
+            f"Finally, my answer is: <response>\n{response_inner}\n</response>"
         ).strip()
-
-    # variant == 5: malformed opening risk tag (missing ``>`` on the first line).
-    if method == "method1":
-        rb = f"<risk_factors\n{risk_inner}\n</risk_factors>"
-    else:
-        rb = f"<{TAG_RISK_WITH_BOXES}\n{risk_inner}\n</{TAG_RISK_WITH_BOXES}>"
-    return (
-        f"{rb}\n"
-        f"<logic>\n{logic_inner}\n</logic>\n"
-        f"<response>\n{response_inner}\n</response>"
-    ).strip()
+    if variant == 5:
+        if method == "method1":
+            rb = f"risk_factors\n{risk_inner}\nend risk_factors"
+        else:
+            rb = f"{TAG_RISK_WITH_BOXES}\n{risk_inner}\nend {TAG_RISK_WITH_BOXES}"
+        return (
+            f"{rb}\n"
+            f"logic\n{logic_inner}\nend logic\n"
+            f"response\n{response_inner}\nend response"
+        ).strip()
 
 
 def build_method2_bbox_perturb_rejected(
