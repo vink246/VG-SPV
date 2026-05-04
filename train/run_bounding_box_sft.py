@@ -124,7 +124,8 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="ID_OR_PATH",
-        help="Additional hub id or save_to_disk path (repeatable). All sources are concatenated after --dataset_id.",
+        help="Additional hub id or save_to_disk path (repeatable). Concatenated after --dataset_id when schemas match. "
+        "PaDT: use only PaDT-MLLM/RefCOCO (it already includes refcoco+ / refcocog data); separate PaDT RefCOCO+ hubs are often absent.",
     )
     p.add_argument(
         "--dataset_config",

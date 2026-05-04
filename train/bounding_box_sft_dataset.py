@@ -3,7 +3,7 @@ HF datasets → bounding-box SFT rows (image, referring expression, one or more 
 
 Supported hubs (see ``scripts/download_bounding_box_sft_datasets.py``):
   - lmms-lab/RefCOCO (val/test splits; eval-oriented)
-  - PaDT-MLLM/RefCOCO, RefCOCOPlus, RefCOCOg (typically include train; Shikra/VoCoT-style REC)
+  - PaDT-MLLM/RefCOCO (single hub; default config bundles refcoco / refcoco+ / refcocog JSON splits)
 
 Local directories created with ``Dataset.save_to_disk`` / ``DatasetDict.save_to_disk`` can be passed
 instead of a hub id (PACE scratch mirrors of HF caches).
@@ -246,16 +246,31 @@ def load_bbox_sft_hf_datasets(
 
     if not dataset_sources:
         raise ValueError("dataset_sources must be non-empty")
-    parts = [
-        _load_one_bbox_sft_source(
-            src,
-            split,
-            trust_remote_code=trust_remote_code,
-            config_name=config_name,
-            local_files_only=local_files_only,
-        )
-        for src in dataset_sources
-    ]
+    parts: list[Any] = []
+    for src in dataset_sources:
+        try:
+            parts.append(
+                _load_one_bbox_sft_source(
+                    src,
+                    split,
+                    trust_remote_code=trust_remote_code,
+                    config_name=config_name,
+                    local_files_only=local_files_only,
+                )
+            )
+        except Exception as e:
+            hint = ""
+            if "RefCOCO" in src or "PaDT" in src:
+                hint = (
+                    " PaDT’s public `PaDT-MLLM/RefCOCO` hub usually bundles refcoco, refcoco+, and refcocog "
+                    "in one dataset (multiple JSON files under the default builder). "
+                    "There is often no separate `PaDT-MLLM/RefCOCOPlus` / `RefCOCOg` hub — use only "
+                    "`--dataset_id PaDT-MLLM/RefCOCO` and omit those `--extra_dataset` flags. "
+                    "Offline: set `HF_HOME` / `HF_DATASETS_CACHE` to your scratch cache and keep the hub id."
+                )
+            raise RuntimeError(
+                f"Failed to load HF dataset source {src!r} (split={split!r}).{hint} Original error: {e}"
+            ) from e
     if len(parts) == 1:
         ds = parts[0]
     else:

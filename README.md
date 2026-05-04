@@ -217,7 +217,7 @@ Training data is stored as **CSV** files with the following columns (headers may
 - **Training HF rows:** Loaded from **`--split`** (default **`train`**) for **`--dataset_id`** plus any **`--extra_dataset`** entries; multiple sources are **concatenated** when their schemas are compatible (`train/bounding_box_sft_dataset.py::load_bbox_sft_hf_datasets`). Cap training rows with **`--max_samples`** for debugging.
 - **Eval HF rows (for `eval_loss`):** The script tries, in order, **`--eval_split`** (default **`val`**), then **`validation`**, then **`test`**. If none of those splits load or they are empty, it **holds out** **`--hf_eval_holdout_fraction`** (default **0.02**) of the **loaded train HF** split into a disjoint eval shard (train HF is then the remainder). Cap eval HF rows after loading with **`--eval_max_samples`**.
 - **Hub vs local disk:** A **`--dataset_id`** or **`--extra_dataset`** value that is an existing directory is loaded with **`datasets.load_from_disk`** (must be a dataset saved with `Dataset.save_to_disk` / `DatasetDict.save_to_disk`). Hub ids use **`datasets.load_dataset`**. For **offline / PACE** cache mirrors, point **`HF_HOME`** (or related HF env vars) at scratch and pass **`--hf_local_files_only`** (implemented via **`DownloadConfig(local_files_only=True)`** in code — PaDT JSON hubs do not accept a top-level `local_files_only` argument to `load_dataset`).
-- **More REC data:** PaDT hosts RefCOCO / RefCOCO+ / RefCOCOg under [`PaDT-MLLM`](https://huggingface.co/PaDT-MLLM); lmms-lab hubs expose **`val`** splits for IoU eval (`eval/run_bounding_box_sft_eval.py`). The downloader [`scripts/download_bounding_box_sft_datasets.py`](scripts/download_bounding_box_sft_datasets.py) presets **`train_rec`** / **`eval_rec`** warm the cache.
+- **More REC data:** On Hugging Face, **`PaDT-MLLM/RefCOCO`** is typically **one** dataset card whose default builder already lists **refcoco**, **refcoco+**, and **refcocog** train/val/test JSON files together. There is usually **no** separate hub id like `PaDT-MLLM/RefCOCOPlus` — passing it as `--extra_dataset` triggers `DatasetNotFoundError`. Use **`--dataset_id PaDT-MLLM/RefCOCO` only** (no PaDT extras) unless you have verified additional hub ids. **lmms-lab** hosts separate **`RefCOCO` / `RefCOCOplus` / `RefCOCOg`** hubs (mostly **`val`** for eval). The downloader [`scripts/download_bounding_box_sft_datasets.py`](scripts/download_bounding_box_sft_datasets.py) presets **`train_rec`** / **`eval_rec`** warm the cache.
 - **PaDT builder config:** On current Hugging Face `datasets`, these PaDT hubs typically expose a single builder config named **`default`**. Do **not** pass `--dataset_config refcoco` (that name is not registered); omit **`--dataset_config`** or set **`--dataset_config default`** if you need to be explicit. If unsure, run `from datasets import get_dataset_config_names; print(get_dataset_config_names("PaDT-MLLM/RefCOCO"))` in Python.
 
 ### MM-SafetyBench Method 2 CSVs (VG-SPV traces)
@@ -253,8 +253,8 @@ MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct OUTPUT_DIR=outputs/bbox_sft_
 # Example: extra PaDT hubs + offline hub cache on a cluster:
 # export HF_HOME=$SCRATCH/huggingface
 # MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct bash scripts/run_bounding_box_sft.sh \
-#   --hf_local_files_only \
-#   --extra_dataset PaDT-MLLM/RefCOCOPlus --extra_dataset PaDT-MLLM/RefCOCOg
+#   --hf_local_files_only
+# (PaDT: do not add --extra_dataset PaDT-MLLM/RefCOCOPlus — use --dataset_id PaDT-MLLM/RefCOCO only.)
 
 # Or invoke Python directly (Windows-friendly)
 python train/run_bounding_box_sft.py ^
