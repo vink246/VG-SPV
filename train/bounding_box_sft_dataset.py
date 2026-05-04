@@ -220,7 +220,11 @@ def _load_one_bbox_sft_source(
     if config_name:
         kwargs["name"] = config_name
     if local_files_only:
-        kwargs["local_files_only"] = True
+        # PaDT JSON-style hubs reject top-level ``local_files_only`` (it is mistaken for a
+        # builder config field). Use ``DownloadConfig`` so only the downloader stays local.
+        from datasets import DownloadConfig
+
+        kwargs["download_config"] = DownloadConfig(local_files_only=True)
     return load_dataset(dataset_id_or_path, split=split, **kwargs)
 
 

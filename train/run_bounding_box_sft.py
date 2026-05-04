@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--hf_local_files_only",
         action="store_true",
-        help="Hub loads only: use local HF cache (no network). Set HF_HOME to scratch on PACE.",
+        help="Hub loads only: pass DownloadConfig(local_files_only=True) (no network). Set HF_HOME on PACE.",
     )
     p.add_argument("--max_samples", type=int, default=None, help="Cap HF dataset size for debugging.")
     p.add_argument(
