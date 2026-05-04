@@ -52,6 +52,7 @@ VG-SPV/
 │   ├── lora_factory.py            # Attach PEFT LoRA + freeze vision (bbox SFT / reuse)
 │   ├── run_dpo.py                 # DPO training entrypoint (`--config`, optional `--lora_adapter_path`)
 │   ├── run_bounding_box_sft.py    # LoRA SFT: referring expression → XML + normalized boxes
+│   ├── hf_training_args_compat.py # TrainingArguments kwargs filtered for transformers version drift
 │   ├── bounding_box_sft_collator.py   # Multimodal batching + label masking
 │   ├── bounding_box_sft_dataset.py    # HF RefCOCO-style rows → chat messages
 │   ├── bounding_box_sft_schema.py     # `<risk_factors_with_boxes>` prompt/answer templates
@@ -330,6 +331,7 @@ When `--lora_adapter_path` is set, **the reference model is an explicit frozen c
 
 **Implementation notes**
 
+- **`train/hf_training_args_compat.py`** filters `TrainingArguments` kwargs to the installed `transformers` signature (drops unsupported keys with a stderr notice) and maps **`eval_strategy`** vs **`evaluation_strategy`** so bbox SFT does not crash on version skew.
 - **TinyLLaVA** is not supported by the bounding-box SFT collator yet (no shared HF `processor.apply_chat_template` path); extend `train/bounding_box_sft_collator.py` if you need it.
 - Bounding boxes in rows are assumed to be **COCO xywh in pixels** unless all four numbers already lie in `[0,1]` as **xyxy** (see `train/bounding_box_sft_dataset.py`). For **multiple instances**, supply a list of boxes in **`bbox`** (list-of-lists) or use columns **`bboxes`**, **`boxes`**, **`gt_boxes`**, or **`bbox_list`**; training emits one `phrase: ... | box: ...` line per box.
 - LoRA targets default to Mistral/Llama linear projections (`train/lora_factory.py`); widen if your checkpoint uses different submodule names.

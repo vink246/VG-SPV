@@ -28,13 +28,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch
 from peft import PeftModel
-from transformers import Trainer, TrainerCallback, TrainingArguments
+from transformers import Trainer, TrainerCallback
 
 from train.bounding_box_sft_collator import BoundingBoxSFTCollator
 from train.bounding_box_sft_dataset import load_bbox_sft_hf_datasets, load_vgspv_csv_rows_for_sft
 from train.bounding_box_sft_schema import BOX_COORD_SCALE
 from train.bounding_box_sft_torch_dataset import BoundingBoxSFTConcatEvalDataset, BoundingBoxSFTMixedIndexDataset
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION
+from train.hf_training_args_compat import apply_eval_scheduling_kwargs, instantiate_training_arguments
 from train.lora_factory import attach_lora, default_lora_config
 from vlm import load_vlm
 
@@ -448,12 +449,16 @@ def main() -> None:
     # ``trainer.train()`` anyway (``adapter/``, ``adapter_latest/`` + callbacks on_train_end).
     if save_strategy == "steps":
         targs_kw["save_steps"] = save_steps_val
-    if eval_ds is not None and len(eval_ds) > 0:
+    eval_dataset_arg = eval_ds if eval_ds is not None and len(eval_ds) > 0 else None
+    if eval_dataset_arg is not None:
         eval_steps = int(args.eval_steps) if args.eval_steps is not None else max(int(args.logging_steps), 50)
-        targs_kw["evaluation_strategy"] = "steps"
-        targs_kw["eval_steps"] = max(1, eval_steps)
-        targs_kw["per_device_eval_batch_size"] = int(args.per_device_eval_batch_size)
-    targs = TrainingArguments(**targs_kw)
+        if not apply_eval_scheduling_kwargs(
+            targs_kw,
+            eval_steps=eval_steps,
+            per_device_eval_batch_size=int(args.per_device_eval_batch_size),
+        ):
+            eval_dataset_arg = None
+    targs = instantiate_training_arguments(**targs_kw)
 
     callbacks: list[TrainerCallback] = [
         SaveAdapterLatestCallback(adapter_latest, loaded.tokenizer, loaded.processor),
@@ -472,7 +477,7 @@ def main() -> None:
         model=model,
         args=targs,
         train_dataset=torch_ds,
-        eval_dataset=eval_ds if eval_ds is not None and len(eval_ds) > 0 else None,
+        eval_dataset=eval_dataset_arg,
         data_collator=collator,
         callbacks=callbacks,
     )
