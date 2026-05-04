@@ -72,6 +72,27 @@ def eval_strategy_parameter_name() -> str | None:
     return None
 
 
+def apply_epoch_eval_scheduling_kwargs(
+    targs_kw: dict[str, Any],
+    *,
+    per_device_eval_batch_size: int,
+) -> bool:
+    """
+    Run ``eval_loss`` at the end of each training epoch (aligned with ``save_strategy="epoch"``).
+    """
+    es = eval_strategy_parameter_name()
+    if es is None:
+        print(
+            "[hf_training_args_compat] TrainingArguments has neither eval_strategy nor "
+            "evaluation_strategy; epoch eval scheduling disabled.",
+            file=sys.stderr,
+        )
+        return False
+    targs_kw[es] = "epoch"
+    targs_kw["per_device_eval_batch_size"] = int(per_device_eval_batch_size)
+    return True
+
+
 def apply_eval_scheduling_kwargs(
     targs_kw: dict[str, Any],
     *,

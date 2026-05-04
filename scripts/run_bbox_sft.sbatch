@@ -23,6 +23,8 @@
 #   OUTPUT_DIR/adapter_latest/ (overwritten each save).
 # - Default training mode matches Method-2 / VG-SPV CSV-only SFT (see knobs):
 #     --vgspv_csv … --vgspv_csv_supervised_only --max_samples 1
+# - Checkpoints: omit --save_every_steps (default 0) for HF save + eval_loss each epoch.
+#   Set SAVE_EVERY_STEPS>0 only if you want step-based saves instead.
 # ============================================================================
 
 set -euo pipefail
@@ -52,8 +54,8 @@ MAX_HF_TRAIN_SAMPLES=1
 # Stop if eval_loss does not improve for this many consecutive eval runs (0 = off).
 EVAL_EARLY_STOPPING_PATIENCE=3
 
-# Checkpoint cadence (0 disables). Only the latest folder is kept.
-SAVE_EVERY_STEPS=200
+# Step-based HF saves (optional). Leave 0 for per-epoch save + eval (default in train script).
+SAVE_EVERY_STEPS=0
 
 # Training hyperparams (adjust as needed)
 EPOCHS=1
@@ -81,7 +83,7 @@ echo "VGSPV_EVAL   : ${VGSPV_EVAL_CSV}"
 echo "EVAL_ES_PAT  : ${EVAL_EARLY_STOPPING_PATIENCE}"
 echo "CSV_ONLY     : vgspv_csv_supervised_only + max_samples=${MAX_HF_TRAIN_SAMPLES}"
 echo "RESUME       : ${RESUME_ADAPTER_PATH:-<none>}"
-echo "SAVE_STEPS   : ${SAVE_EVERY_STEPS}"
+echo "SAVE_STEPS   : ${SAVE_EVERY_STEPS} (0 = per-epoch save+eval)"
 echo "================="
 nvidia-smi -L 2>/dev/null || echo "  (nvidia-smi not available)"
 echo "================="
@@ -95,7 +97,7 @@ if [[ -n "${RESUME_ADAPTER_PATH}" ]]; then
   RESUME_ARGS=( --resume_adapter_path "${RESUME_ADAPTER_PATH}" )
 fi
 
-conda run -n vg-spv --no-capture-output python -u train/run_bounding_box_sft.py \
+conda run -p ~/scratch/envs/vg-spv --no-capture-output python -u train/run_bounding_box_sft.py \
   --model_name "${MODEL_NAME}" \
   --vgspv_csv "${VGSPV_CSV}" \
   --vgspv_eval_csv "${VGSPV_EVAL_CSV}" \
@@ -108,7 +110,7 @@ conda run -n vg-spv --no-capture-output python -u train/run_bounding_box_sft.py 
   --gradient_accumulation_steps "${GRAD_ACCUM}" \
   --learning_rate "${LR}" \
   --warmup_ratio "${WARMUP_RATIO}" \
-  --save_every_steps "${SAVE_EVERY_STEPS}" \
+  $( [[ "${SAVE_EVERY_STEPS:-0}" -gt 0 ]] && echo --save_every_steps "${SAVE_EVERY_STEPS}" ) \
   ${BF16} \
   ${GRAD_CKPT} \
   "${RESUME_ARGS[@]}"

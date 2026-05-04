@@ -12,12 +12,14 @@ Requires: torch, transformers, peft, datasets, accelerate, pillow.
 
 Default HF REC source is **PaDT-MLLM/RefCOCO** (``--dataset_id``). When
 ``data/mm-safebench_1/extracted_data/traces/train_method2.csv`` exists, it is **mixed into training**
-with PaDT at ``--vgspv_mix_fraction`` (default **0.25**). With ``--vgspv_csv_supervised_only`` and a
-resolvable eval CSV (``--vgspv_eval_csv`` or default ``test_method2.csv``), **eval_loss uses the test
-CSV only** (PaDT val eval is skipped). Otherwise default eval adds ``test_method2.csv`` alongside HF
-eval; when both exist, validation may use a **balanced subset** (100+100 by default; use
-``--eval_no_balanced_subset`` for full concat). ``--eval_early_stopping_patience`` stops training after
-that many evals with no ``eval_loss`` improvement. Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` for paths;
+with PaDT at ``--vgspv_mix_fraction`` (default **0.25**). By default **``--save_every_steps 0``** enables
+**per-epoch HF checkpoints** and **``eval_loss`` after each epoch** (aligned saves). Use **``--save_every_steps N``**
+for step-based saves + step eval instead. With ``--vgspv_csv_supervised_only`` and a resolvable eval CSV
+(``--vgspv_eval_csv`` or default ``test_method2.csv``), **eval_loss uses the test CSV only** (PaDT val eval
+is skipped). Otherwise default eval adds ``test_method2.csv`` alongside HF eval; when both exist,
+validation may use a **balanced subset** (100+100 by default; use ``--eval_no_balanced_subset`` for full
+concat). ``--eval_early_stopping_patience`` stops after that many evals with no ``eval_loss`` improvement
+(**epochs** when using per-epoch eval). Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` for paths;
 ``--no_vgspv_csv`` or ``--skip_eval`` to disable those sides.
 
 Checkpoints default to **not** saving the optimizer (``save_only_model``), which avoids huge
@@ -49,7 +51,11 @@ from train.bounding_box_sft_schema import BOX_COORD_SCALE
 from train.bounding_box_sft_torch_dataset import BoundingBoxSFTConcatEvalDataset, BoundingBoxSFTMixedIndexDataset
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION
 from train.bounding_box_sft_trainer import BoundingBoxSFTTrainer
-from train.hf_training_args_compat import apply_eval_scheduling_kwargs, instantiate_training_arguments
+from train.hf_training_args_compat import (
+    apply_epoch_eval_scheduling_kwargs,
+    apply_eval_scheduling_kwargs,
+    instantiate_training_arguments,
+)
 from train.lora_factory import attach_lora, default_lora_config, normalize_no_split_modules_for_accelerate
 from vlm import load_vlm
 
@@ -232,14 +238,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--save_every_steps",
         type=int,
-        default=500,
-        help="Save a HF checkpoint (and mirror adapter_latest) every N global steps; 0 disables step-based saves.",
+        default=0,
+        help="If > 0: save HF checkpoints every N global steps and run eval on the same step interval. "
+        "If 0 (default): save at end of every epoch and run eval each epoch (val loss per epoch; "
+        "mirrors adapter_latest on each save).",
     )
     p.add_argument(
         "--save_every_n_epochs",
         type=int,
         default=0,
-        help="Additionally save a checkpoint every N epochs (0 = off). Works alongside save_every_steps.",
+        help="When using --save_every_steps > 0 only: additionally call save_model every N completed epochs "
+        "(0 = off). Ignored when --save_every_steps is 0 (epoch-based save already runs each epoch).",
     )
     p.add_argument(
         "--save_total_limit",
@@ -305,14 +314,16 @@ def parse_args() -> argparse.Namespace:
         "--eval_steps",
         type=int,
         default=None,
-        help="Run eval every N steps (default: max(logging_steps, 50)). Ignored with --skip_eval.",
+        help="Only when --save_every_steps > 0: run eval every N global steps (default: max(logging_steps, 50)). "
+        "Ignored when --save_every_steps is 0 (eval runs every epoch). Ignored with --skip_eval.",
     )
     p.add_argument(
         "--eval_early_stopping_patience",
         type=int,
         default=0,
         help="Stop training after this many eval runs without improvement in eval_loss (0 = disabled). "
-        "When > 0, enables load_best_model_at_end on eval_loss and aligns save_steps with eval_steps.",
+        "When > 0, enables load_best_model_at_end on eval_loss. With --save_every_steps 0, each epoch is one "
+        "eval (patience = epochs without improvement). With --save_every_steps > 0, save_steps align with eval_steps.",
     )
     p.add_argument("--per_device_eval_batch_size", type=int, default=1)
     p.add_argument("--skip_eval", action="store_true", help="Disable eval loss (train loss only).")
@@ -566,11 +577,9 @@ def main() -> None:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
-    save_strategy = "no"
-    save_steps_val = 500
-    if args.save_every_steps and args.save_every_steps > 0:
-        save_strategy = "steps"
-        save_steps_val = int(args.save_every_steps)
+    use_step_checkpointing = bool(args.save_every_steps and int(args.save_every_steps) > 0)
+    save_strategy = "steps" if use_step_checkpointing else "epoch"
+    save_steps_val = int(args.save_every_steps) if use_step_checkpointing else 0
 
     targs_kw: dict = dict(
         output_dir=str(out),
@@ -604,46 +613,77 @@ def main() -> None:
     orig_save_strategy = save_strategy
     orig_save_steps_val = save_steps_val
 
-    eval_steps_effective = int(args.eval_steps) if args.eval_steps is not None else max(int(args.logging_steps), 50)
-    eval_steps_effective = max(1, eval_steps_effective)
+    eval_steps_effective: int | None = None
+    eval_schedule = "steps" if use_step_checkpointing else "epoch"
 
     if eval_dataset_arg is not None:
-        if esp > 0:
-            sync_steps = eval_steps_effective
-            if save_strategy == "steps" and args.save_every_steps and int(args.save_every_steps) > 0:
-                sync_steps = max(sync_steps, int(args.save_every_steps))
-            sync_steps = max(1, sync_steps)
-            eval_steps_effective = sync_steps
-            targs_kw["save_strategy"] = "steps"
-            targs_kw["save_steps"] = sync_steps
-        if not apply_eval_scheduling_kwargs(
-            targs_kw,
-            eval_steps=eval_steps_effective,
-            per_device_eval_batch_size=int(args.per_device_eval_batch_size),
-        ):
-            eval_dataset_arg = None
-            if esp > 0:
-                targs_kw["save_strategy"] = orig_save_strategy
-                if orig_save_strategy == "steps":
-                    targs_kw["save_steps"] = orig_save_steps_val
-                else:
-                    targs_kw.pop("save_steps", None)
-        elif esp > 0:
-            targs_kw["load_best_model_at_end"] = True
-            targs_kw["metric_for_best_model"] = "eval_loss"
-            targs_kw["greater_is_better"] = False
-            print(
-                f"[bbox_sft] Early stopping on eval_loss: patience={esp} evals; "
-                f"eval/save every {eval_steps_effective} steps; load_best_model_at_end.",
-                flush=True,
+        if use_step_checkpointing:
+            eval_steps_effective = int(args.eval_steps) if args.eval_steps is not None else max(
+                int(args.logging_steps), 50
             )
+            eval_steps_effective = max(1, int(eval_steps_effective))
+            if esp > 0:
+                sync_steps = eval_steps_effective
+                if save_strategy == "steps" and int(args.save_every_steps) > 0:
+                    sync_steps = max(sync_steps, int(args.save_every_steps))
+                sync_steps = max(1, sync_steps)
+                eval_steps_effective = sync_steps
+                targs_kw["save_strategy"] = "steps"
+                targs_kw["save_steps"] = sync_steps
+            if not apply_eval_scheduling_kwargs(
+                targs_kw,
+                eval_steps=int(eval_steps_effective),
+                per_device_eval_batch_size=int(args.per_device_eval_batch_size),
+            ):
+                eval_dataset_arg = None
+                if esp > 0:
+                    targs_kw["save_strategy"] = orig_save_strategy
+                    if orig_save_strategy == "steps":
+                        targs_kw["save_steps"] = orig_save_steps_val
+                    else:
+                        targs_kw.pop("save_steps", None)
+            elif esp > 0:
+                targs_kw["load_best_model_at_end"] = True
+                targs_kw["metric_for_best_model"] = "eval_loss"
+                targs_kw["greater_is_better"] = False
+                print(
+                    f"[bbox_sft] Early stopping on eval_loss: patience={esp} evals; "
+                    f"eval/save every {eval_steps_effective} steps; load_best_model_at_end.",
+                    flush=True,
+                )
+            if eval_dataset_arg is not None:
+                print(
+                    f"[bbox_sft] Step mode: HF checkpoint + eval_loss every {eval_steps_effective} global steps.",
+                    flush=True,
+                )
+        else:
+            if not apply_epoch_eval_scheduling_kwargs(
+                targs_kw,
+                per_device_eval_batch_size=int(args.per_device_eval_batch_size),
+            ):
+                eval_dataset_arg = None
+            else:
+                print(
+                    "[bbox_sft] Epoch mode: HF checkpoint + eval_loss at the end of each epoch.",
+                    flush=True,
+                )
+                if esp > 0:
+                    targs_kw["load_best_model_at_end"] = True
+                    targs_kw["metric_for_best_model"] = "eval_loss"
+                    targs_kw["greater_is_better"] = False
+                    print(
+                        f"[bbox_sft] Early stopping on eval_loss: patience={esp} epochs without improvement; "
+                        "load_best_model_at_end.",
+                        flush=True,
+                    )
 
     final_has_eval = eval_dataset_arg is not None
 
     targs = instantiate_training_arguments(**targs_kw)
     if not args.save_optimizer_state:
+        ckpt_desc = "per-epoch" if not use_step_checkpointing else "step"
         print(
-            "[bbox_sft] HF step checkpoints: model/adapter only (optimizer not saved). "
+            f"[bbox_sft] HF {ckpt_desc} checkpoints: model/adapter only (optimizer not saved). "
             "Use --save_optimizer_state for full HF state (large).",
             flush=True,
         )
@@ -654,7 +694,7 @@ def main() -> None:
     if esp > 0 and eval_dataset_arg is not None:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=esp))
     epoch_cb: SaveEveryNEpochsCallback | None = None
-    if args.save_every_n_epochs and int(args.save_every_n_epochs) > 0:
+    if use_step_checkpointing and args.save_every_n_epochs and int(args.save_every_n_epochs) > 0:
         epoch_cb = SaveEveryNEpochsCallback(
             int(args.save_every_n_epochs),
             adapter_latest,
@@ -701,7 +741,8 @@ def main() -> None:
         "eval_balanced_subset": eval_balanced_meta,
         "eval_balanced_per_side": args.eval_balanced_per_side,
         "eval_no_balanced_subset": bool(args.eval_no_balanced_subset),
-        "eval_steps": eval_steps_effective if final_has_eval else None,
+        "eval_schedule": eval_schedule,
+        "eval_steps": eval_steps_effective if final_has_eval and use_step_checkpointing else None,
         "eval_early_stopping_patience": esp,
         "csv_supervised_test_csv_eval_only": csv_supervised_test_csv_eval_only,
         "per_device_eval_batch_size": int(args.per_device_eval_batch_size) if final_has_eval else None,
@@ -719,7 +760,9 @@ def main() -> None:
         "mix_seed": args.mix_seed,
         "no_vgspv_csv": bool(args.no_vgspv_csv),
         "resume_adapter_path": args.resume_adapter_path,
-        "save_every_steps": args.save_every_steps,
+        "save_every_steps": int(args.save_every_steps),
+        "save_strategy": save_strategy,
+        "use_step_checkpointing": use_step_checkpointing,
         "save_every_n_epochs": args.save_every_n_epochs,
         "save_optimizer_state": bool(args.save_optimizer_state),
         "save_only_model": not bool(args.save_optimizer_state),
