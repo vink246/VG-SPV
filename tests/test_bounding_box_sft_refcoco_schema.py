@@ -41,3 +41,15 @@ def test_flat_utterance_column() -> None:
     row = {"image": img, "utterance": "the red ball", "bbox": [0.0, 0.0, 0.2, 0.2]}
     sample = hf_row_to_bbox_sft_sample(row)
     assert "red ball" in sample.messages[1]["content"][0]["text"]
+
+
+def test_image_as_filesystem_path_string(tmp_path) -> None:
+    """PaDT-style hubs often store ``image`` as a path string, not a decoded PIL."""
+    from train.bounding_box_sft_dataset import hf_row_to_bbox_sft_sample
+
+    p = tmp_path / "im.png"
+    Image.new("RGB", (40, 30), color=(1, 2, 3)).save(p)
+    row = {"image": str(p), "utterance": "the red ball", "bbox": [0.0, 0.0, 0.2, 0.2]}
+    sample = hf_row_to_bbox_sft_sample(row)
+    assert sample.image.size == (40, 30)
+    assert "red ball" in sample.messages[1]["content"][0]["text"]

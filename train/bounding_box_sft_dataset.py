@@ -282,18 +282,40 @@ def get_row_pil_image(row: dict[str, Any]) -> Any:
 
 
 def _get_image(row: dict[str, Any]) -> Any:
+    from io import BytesIO
+    from urllib.error import URLError
+    from urllib.request import Request, urlopen
+
     img = row.get("image")
     if img is None:
         raise KeyError("Row missing 'image'")
     if isinstance(img, dict):
-        from io import BytesIO
-
         if img.get("bytes"):
             return Image.open(BytesIO(img["bytes"])).convert("RGB")
         if img.get("path"):
             return Image.open(img["path"]).convert("RGB")
     if isinstance(img, Image.Image):
         return img.convert("RGB")
+    if isinstance(img, (bytes, bytearray)):
+        return Image.open(BytesIO(bytes(img))).convert("RGB")
+    if isinstance(img, str):
+        s = img.strip()
+        if not s:
+            raise ValueError("Row has empty image path")
+        if s.startswith(("http://", "https://")):
+            req = Request(s, headers={"User-Agent": "VG-SPV-bbox-sft/1.0"})
+            try:
+                with urlopen(req, timeout=120) as r:
+                    return Image.open(BytesIO(r.read())).convert("RGB")
+            except URLError as e:
+                raise ValueError(f"Could not download image URL: {s!r}") from e
+        path = Path(s).expanduser()
+        if path.is_file():
+            return Image.open(path).convert("RGB")
+        try:
+            return Image.open(s).convert("RGB")
+        except OSError as e:
+            raise ValueError(f"Could not open image path: {s!r}") from e
     return img
 
 
