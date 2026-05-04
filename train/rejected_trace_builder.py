@@ -293,9 +293,7 @@ def _sample_zero_iou_box(
         iou = iou_xyxy_norm(orig, cand)
         if iou <= _IOU_ZERO_EPS:
             return cand
-    # Fallback: shrink box into a corner guaranteed disjoint from orig (axis-aligned gap).
-    ox0, oy0, ox1, oy1 = orig
-    # Pick bottom-right tiny square if orig is top-left heavy, etc.
+    # Fallback: try fixed corner boxes disjoint from ``orig`` when possible.
     corners = [
         (0.02, 0.02, 0.25, 0.25),
         (0.75, 0.02, 0.98, 0.25),
@@ -572,13 +570,13 @@ def build_format_break_rejected(chosen_trace: str, method: MethodTag, rng: rando
     if variant == 0:
         return (
             f"{risk_block}\n"
-            f"<logic>\n{logic_inner}\n</thinking>\n"
-            f"<response>\n{response_inner}\n</response>"
+            f"<thinking>\n{logic_inner}\n</thinking>\n"
+            f"<final_answer>\n{response_inner}\n</final_answer>"
         ).strip()
     if variant == 1:
         return (
             f"{risk_block}\n"
-            f"<logic>\n{logic_inner}\n</logic>\n"
+            f"\n{logic_inner}\n</logic>\n"
             f"<response>\n{response_inner}"
         ).strip()
     if variant == 2:
@@ -592,11 +590,10 @@ def build_format_break_rejected(chosen_trace: str, method: MethodTag, rng: rando
             f"<response>\n{response_inner}\n</response>"
         ).strip()
     if variant == 3:
-        # Unclosed ``<logic>`` so ``<response>`` appears inside the logic region (parse fail).
         return (
             f"{risk_block}\n"
-            f"<logic>\n{logic_inner}\n"
-            f"<response>\n{response_inner}\n</response>"
+            f"\n{logic_inner}\n"
+            f"\n{response_inner}\n"
         ).strip()
     if variant == 4:
         if method == "method2":
