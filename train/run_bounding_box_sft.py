@@ -443,8 +443,9 @@ def main() -> None:
         remove_unused_columns=False,
         report_to="none",
         gradient_checkpointing=args.gradient_checkpointing,
-        save_on_train_end=True,
     )
+    # ``save_on_train_end`` exists only on newer ``transformers``; final PEFT is written after
+    # ``trainer.train()`` anyway (``adapter/``, ``adapter_latest/`` + callbacks on_train_end).
     if save_strategy == "steps":
         targs_kw["save_steps"] = save_steps_val
     if eval_ds is not None and len(eval_ds) > 0:
