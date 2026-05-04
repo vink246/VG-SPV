@@ -1,9 +1,12 @@
 """
 HF datasets → bounding-box SFT rows (image, referring expression, one or more normalized xyxy boxes).
 
-Supported hubs (see `data/download_bounding_box_sft_datasets.py`):
+Supported hubs (see ``scripts/download_bounding_box_sft_datasets.py``):
   - lmms-lab/RefCOCO (val/test splits; eval-oriented)
   - PaDT-MLLM/RefCOCO, RefCOCOPlus, RefCOCOg (typically include train; Shikra/VoCoT-style REC)
+
+Local directories created with ``Dataset.save_to_disk`` / ``DatasetDict.save_to_disk`` can be passed
+instead of a hub id (PACE scratch mirrors of HF caches).
 """
 
 from __future__ import annotations
@@ -18,10 +21,13 @@ from PIL import Image
 from train.bounding_box_sft_schema import build_assistant_bbox_sft_multi, user_text_with_expression
 from train.dataset_adapter import (
     CHOSEN_REASONING_TRACE_COL,
+    DPO_PROMPT_COL,
     IMAGE_COL,
     PERTURBED_IMAGE_COL,
     REJECTED_REASONING_TRACE_COL,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass
@@ -182,6 +188,84 @@ def hf_row_to_bbox_sft_sample(row: dict[str, Any]) -> BoundingBoxSFTSample:
     return BoundingBoxSFTSample(image=image, messages=messages)
 
 
+def _load_one_bbox_sft_source(
+    dataset_id_or_path: str,
+    split: str,
+    *,
+    trust_remote_code: bool = True,
+    config_name: str | None = None,
+    local_files_only: bool = False,
+):
+    """Load a single HF hub dataset or a ``save_to_disk`` directory (Dataset or DatasetDict)."""
+    from datasets import DatasetDict, load_dataset, load_from_disk
+
+    p = Path(dataset_id_or_path).expanduser()
+    if p.is_dir():
+        try:
+            d = load_from_disk(str(p))
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not load_dataset from local path {p}. "
+                "Expected a directory produced by Dataset.save_to_disk / DatasetDict.save_to_disk."
+            ) from e
+        if isinstance(d, DatasetDict):
+            if split not in d:
+                raise ValueError(f"Split {split!r} not found in disk dataset. Available: {list(d.keys())}")
+            return d[split]
+        return d
+
+    kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    if config_name:
+        kwargs["name"] = config_name
+    if local_files_only:
+        kwargs["local_files_only"] = True
+    return load_dataset(dataset_id_or_path, split=split, **kwargs)
+
+
+def load_bbox_sft_hf_datasets(
+    dataset_sources: list[str],
+    split: str,
+    *,
+    max_samples: int | None = None,
+    trust_remote_code: bool = True,
+    config_name: str | None = None,
+    local_files_only: bool = False,
+):
+    """
+    Load one or more REC-style datasets and concatenate (same split key for each hub source).
+
+    All parts must be row-compatible with ``hf_row_to_bbox_sft_sample`` (image + expression + bbox).
+    """
+    from datasets import concatenate_datasets
+
+    if not dataset_sources:
+        raise ValueError("dataset_sources must be non-empty")
+    parts = [
+        _load_one_bbox_sft_source(
+            src,
+            split,
+            trust_remote_code=trust_remote_code,
+            config_name=config_name,
+            local_files_only=local_files_only,
+        )
+        for src in dataset_sources
+    ]
+    if len(parts) == 1:
+        ds = parts[0]
+    else:
+        try:
+            ds = concatenate_datasets(parts)
+        except Exception as e:
+            raise RuntimeError(
+                "concatenate_datasets failed — sources may use incompatible column/feature schemas. "
+                "Train on one source at a time or preprocess to a common schema."
+            ) from e
+    if max_samples is not None and max_samples > 0:
+        n = min(max_samples, len(ds))
+        ds = ds.select(range(n))
+    return ds
+
+
 def load_bbox_sft_hf_dataset(
     dataset_id: str,
     split: str,
@@ -189,17 +273,16 @@ def load_bbox_sft_hf_dataset(
     max_samples: int | None = None,
     trust_remote_code: bool = True,
     config_name: str | None = None,
+    local_files_only: bool = False,
 ):
-    from datasets import load_dataset
-
-    kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
-    if config_name:
-        kwargs["name"] = config_name
-    ds = load_dataset(dataset_id, split=split, **kwargs)
-    if max_samples is not None and max_samples > 0:
-        n = min(max_samples, len(ds))
-        ds = ds.select(range(n))
-    return ds
+    return load_bbox_sft_hf_datasets(
+        [dataset_id],
+        split,
+        max_samples=max_samples,
+        trust_remote_code=trust_remote_code,
+        config_name=config_name,
+        local_files_only=local_files_only,
+    )
 
 
 def build_bbox_sft_sample_from_hf(ds, index: int) -> BoundingBoxSFTSample:
@@ -217,6 +300,7 @@ def _norm_csv_column_names(ds):
         norm(PERTURBED_IMAGE_COL): PERTURBED_IMAGE_COL,
         norm(CHOSEN_REASONING_TRACE_COL): CHOSEN_REASONING_TRACE_COL,
         norm(REJECTED_REASONING_TRACE_COL): REJECTED_REASONING_TRACE_COL,
+        norm(DPO_PROMPT_COL): DPO_PROMPT_COL,
     }
     renames = {}
     for c in list(ds.column_names):
@@ -228,11 +312,39 @@ def _norm_csv_column_names(ds):
     return ds
 
 
-def load_vgspv_csv_rows_for_sft(csv_path: str) -> list[dict[str, Any]]:
+def resolve_vgspv_image_path(
+    image_field: str,
+    *,
+    image_root: Path | None = None,
+) -> Path:
+    """Resolve CSV ``image`` paths (often repo-relative) to an existing file."""
+    raw = image_field.strip()
+    p = Path(raw)
+    if p.is_file():
+        return p.resolve()
+    candidates: list[Path] = []
+    if image_root is not None:
+        candidates.append((image_root / raw).resolve())
+    candidates.append((_REPO_ROOT / raw).resolve())
+    candidates.append((Path.cwd() / raw).resolve())
+    for c in candidates:
+        if c.is_file():
+            return c
+    tried = "\n  ".join(str(c) for c in candidates)
+    raise FileNotFoundError(f"Image not found for {raw!r}. Tried:\n  {tried}")
+
+
+def load_vgspv_csv_rows_for_sft(
+    csv_path: str,
+    *,
+    image_root: Path | None = None,
+) -> list[dict[str, Any]]:
     """
     Load VG-fDPO-style CSV rows (same schema as DPO: image + chosen_reasoning_trace + …).
 
     Used to mix safety / risky-object supervision into bounding-box SFT (chosen trace as target).
+    ``image`` paths are resolved with ``resolve_vgspv_image_path`` so repo-relative paths work on
+    PACE when the job cwd is the repo root (override layout with ``image_root``).
     """
     from datasets import load_dataset
 
@@ -247,7 +359,15 @@ def load_vgspv_csv_rows_for_sft(csv_path: str) -> list[dict[str, Any]]:
         raise ValueError(
             f"CSV must have {CHOSEN_REASONING_TRACE_COL} for SFT targets. Got: {ds.column_names}"
         )
-    return [ds[i] for i in range(len(ds))]
+    rows: list[dict[str, Any]] = []
+    for i in range(len(ds)):
+        row = dict(ds[i])
+        img = row.get(IMAGE_COL)
+        if isinstance(img, str) and img.strip():
+            resolved = resolve_vgspv_image_path(img, image_root=image_root)
+            row[IMAGE_COL] = str(resolved)
+        rows.append(row)
+    return rows
 
 
 def vgspv_csv_row_to_bbox_sft_sample(row: dict[str, Any], prompt_instruction: str) -> BoundingBoxSFTSample:
@@ -262,7 +382,11 @@ def vgspv_csv_row_to_bbox_sft_sample(row: dict[str, Any], prompt_instruction: st
     if not isinstance(chosen, str) or not chosen.strip():
         raise ValueError(f"Row missing {CHOSEN_REASONING_TRACE_COL}")
     image = Image.open(path).convert("RGB")
-    prompt = prompt_instruction.strip()
+    per_row = row.get(DPO_PROMPT_COL)
+    if isinstance(per_row, str) and per_row.strip():
+        prompt = per_row.strip()
+    else:
+        prompt = prompt_instruction.strip()
     messages = [
         {
             "role": "user",

@@ -27,7 +27,7 @@ from peft import PeftModel
 from transformers import Trainer, TrainerCallback, TrainingArguments
 
 from train.bounding_box_sft_collator import BoundingBoxSFTCollator
-from train.bounding_box_sft_dataset import load_bbox_sft_hf_dataset, load_vgspv_csv_rows_for_sft
+from train.bounding_box_sft_dataset import load_bbox_sft_hf_datasets, load_vgspv_csv_rows_for_sft
 from train.bounding_box_sft_schema import BOX_COORD_SCALE
 from train.bounding_box_sft_torch_dataset import BoundingBoxSFTMixedIndexDataset
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION
@@ -109,10 +109,22 @@ def parse_args() -> argparse.Namespace:
         "--dataset_id",
         type=str,
         default="PaDT-MLLM/RefCOCO",
-        help="HF dataset (default PaDT-MLLM/RefCOCO — train split; Shikra/VoCoT-style REC).",
+        help="Primary HF hub id, or path to save_to_disk REC data (first shard of combined training).",
+    )
+    p.add_argument(
+        "--extra_dataset",
+        action="append",
+        default=[],
+        metavar="ID_OR_PATH",
+        help="Additional hub id or save_to_disk path (repeatable). All sources are concatenated after --dataset_id.",
     )
     p.add_argument("--dataset_config", type=str, default=None, help="Optional HF config name for the dataset.")
     p.add_argument("--split", type=str, default="train", help="Dataset split (PaDT RefCOCO uses `train`).")
+    p.add_argument(
+        "--hf_local_files_only",
+        action="store_true",
+        help="Hub loads only: use local HF cache (no network). Set HF_HOME to scratch on PACE.",
+    )
     p.add_argument("--max_samples", type=int, default=None, help="Cap HF dataset size for debugging.")
     p.add_argument(
         "--vgspv_csv",
@@ -130,7 +142,13 @@ def parse_args() -> argparse.Namespace:
         "--vgspv_prompt_instruction",
         type=str,
         default=None,
-        help="User text for CSV rows (default: train/dataset_adapter.DEFAULT_PROMPT_INSTRUCTION).",
+        help="Fallback user text when CSV has no `prompt` column (default: DEFAULT_PROMPT_INSTRUCTION).",
+    )
+    p.add_argument(
+        "--vgspv_image_root",
+        type=str,
+        default=None,
+        help="Optional base dir for resolving relative `image` paths in --vgspv_csv (default: repo root + cwd).",
     )
     p.add_argument(
         "--mix_seed",
@@ -201,17 +219,20 @@ def main() -> None:
     if loaded.processor is None:
         raise SystemExit("Bounding-box SFT requires a processor (LLaVA / Mllama / Qwen-VL).")
 
-    hf_ds = load_bbox_sft_hf_dataset(
-        args.dataset_id,
+    sources = [args.dataset_id] + list(args.extra_dataset or [])
+    hf_ds = load_bbox_sft_hf_datasets(
+        sources,
         args.split,
         max_samples=args.max_samples,
         config_name=args.dataset_config,
+        local_files_only=bool(args.hf_local_files_only),
     )
 
     csv_rows: list | None = None
     vgspv_prompt = args.vgspv_prompt_instruction or DEFAULT_PROMPT_INSTRUCTION
+    img_root = Path(args.vgspv_image_root).resolve() if args.vgspv_image_root else None
     if args.vgspv_csv:
-        csv_rows = load_vgspv_csv_rows_for_sft(args.vgspv_csv)
+        csv_rows = load_vgspv_csv_rows_for_sft(args.vgspv_csv, image_root=img_root)
         mf = float(args.vgspv_mix_fraction)
         if mf <= 0:
             raise SystemExit("--vgspv_csv requires --vgspv_mix_fraction > 0.")
@@ -310,13 +331,17 @@ def main() -> None:
         "base_model_name": args.model_name,
         "vlm_family": loaded.family,
         "box_format": f"int_grid_{BOX_COORD_SCALE}",
+        "dataset_sources": sources,
         "dataset_id": args.dataset_id,
+        "extra_dataset": list(args.extra_dataset or []),
         "dataset_config": args.dataset_config,
+        "hf_local_files_only": bool(args.hf_local_files_only),
         "split": args.split,
         "max_samples": args.max_samples,
         "vgspv_csv": args.vgspv_csv,
         "vgspv_mix_fraction": args.vgspv_mix_fraction if csv_rows else 0.0,
         "vgspv_prompt_instruction": vgspv_prompt if csv_rows else None,
+        "vgspv_image_root": str(img_root) if img_root else None,
         "mix_seed": args.mix_seed,
         "resume_adapter_path": args.resume_adapter_path,
         "save_every_steps": args.save_every_steps,

@@ -2,8 +2,10 @@
 Warm the Hugging Face cache for bounding-box SFT datasets (RefCOCO family).
 
 Shikra / VoCoT-style training uses referring-expression comprehension data such as
-RefCOCO, RefCOCO+, and RefCOCOg. We default to PaDT-processed HF releases (train splits)
-and lmms-lab eval splits.
+RefCOCO, RefCOCO+, and RefCOCOg. Defaults use PaDT-processed HF releases (train splits)
+and lmms-lab eval splits. For offline PACE runs, point ``HF_HOME`` (or ``HF_DATASETS_CACHE``)
+at your scratch mirror and use ``train/run_bounding_box_sft.py --hf_local_files_only`` or
+pass ``save_to_disk`` directories via ``--dataset_id`` / ``--extra_dataset``.
 
 Usage (from repo root):
   python scripts/download_bounding_box_sft_datasets.py --preset all
