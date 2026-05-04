@@ -2,8 +2,7 @@
 Build ``rejected_reasoning_trace`` XML from an accepted (chosen) VG-SPV trace.
 
 Implements three conditional paths (abliterated prompts for A/B; hardcoded C), Method-2-only
-bounding-box perturbation, **risk-only** confusable-token edits, and **format_break** malformed
-XML negatives (chosen ``<logic>`` / ``<response>`` inners reused where applicable).
+bounding-box perturbation, **risk-only** confusable-token edits, and **format_break** negatives (broken XML, **tag-free prose**, or stray half-tags; chosen inners reused).
 """
 
 from __future__ import annotations
@@ -546,9 +545,13 @@ def build_method2_risk_perturb_rejected(chosen_trace: str, rng: random.Random) -
 
 def build_format_break_rejected(chosen_trace: str, method: MethodTag, rng: random.Random) -> str | None:
     """
-    Produce **invalid** XML-style layout (wrong tag names, mismatched closers, bad order, or preamble),
-    reusing the same inner text blobs from the chosen trace. Use this as a DPO negative for the
-    paper's format-fail branch (``alpha_format``): the policy should learn to avoid degenerate markup.
+    Produce **invalid** layout for format-fail / ``alpha_format`` negatives:
+
+    - Variants 0–5: broken XML (wrong tag names, mismatched closers, preamble, truncated opens, …).
+    - Variant 6: **no angle-bracket tags** — same content as plain prose blocks.
+    - Variant 7: **stray / half tags** plus prose (orphan closers, truncated opens, pseudo-markers).
+
+    Reuses inner text from the chosen trace; requires a parseable chosen trace to start from.
     """
     parsed = parse_trace_for_rejection(chosen_trace, method)
     if parsed is None:
@@ -564,7 +567,7 @@ def build_format_break_rejected(chosen_trace: str, method: MethodTag, rng: rando
     if risk_inner is None:
         return None
 
-    variant = rng.randrange(6)
+    variant = rng.randrange(8)
 
     if variant == 0:
         return (
@@ -611,15 +614,36 @@ def build_format_break_rejected(chosen_trace: str, method: MethodTag, rng: rando
             f"<response>\n{response_inner}\n</response>"
         ).strip()
 
-    # variant == 5: malformed opening risk tag (missing ``>`` on the first line).
-    if method == "method1":
-        rb = f"<risk_factors\n{risk_inner}\n</risk_factors>"
-    else:
-        rb = f"<{TAG_RISK_WITH_BOXES}\n{risk_inner}\n</{TAG_RISK_WITH_BOXES}>"
+    if variant == 5:
+        # Malformed opening risk tag (missing ``>`` on the first line).
+        if method == "method1":
+            rb = f"<risk_factors\n{risk_inner}\n</risk_factors>"
+        else:
+            rb = f"<{TAG_RISK_WITH_BOXES}\n{risk_inner}\n</{TAG_RISK_WITH_BOXES}>"
+        return (
+            f"{rb}\n"
+            f"<logic>\n{logic_inner}\n</logic>\n"
+            f"<response>\n{response_inner}\n</response>"
+        ).strip()
+
+    if variant == 6:
+        # No XML: labeled prose only (no ``<...>`` contract).
+        risk_one_line = " ".join(risk_inner.split())
+        return (
+            f"Risk notes (unstructured): {risk_one_line}\n\n"
+            f"Chain of thought: {logic_inner}\n\n"
+            f"Final reply: {response_inner}"
+        ).strip()
+
+    # variant == 7: stray closers, truncated opens, bracket noise — not a valid trace.
+    risk_flat = " ".join(risk_inner.split())
+    orphan_close = "</risk_factors>" if method == "method1" else f"</{TAG_RISK_WITH_BOXES}>"
     return (
-        f"{rb}\n"
-        f"<logic>\n{logic_inner}\n</logic>\n"
-        f"<response>\n{response_inner}\n</response>"
+        f"Unformatted model output\n\n"
+        f"{risk_flat}\n\n"
+        f"{orphan_close}\n"
+        f"<logi\n{logic_inner}\n"
+        f"[[RESPONSE]] {response_inner}"
     ).strip()
 
 

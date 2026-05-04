@@ -172,18 +172,37 @@ class TestPlausibleWrongFactor(unittest.TestCase):
 
 class TestFormatBreak(unittest.TestCase):
     def test_variant_mismatch_logic_closer(self):
-        # ``Random(2).randrange(6) == 0`` hits the mismatched ``</thinking>`` logic closer.
+        # ``Random(2).randrange(8) == 0`` hits the mismatched ``</thinking>`` logic closer.
         rng = random.Random(2)
         out = build_format_break_rejected(M1_FULL_A, "method1", rng)
         assert out is not None
         self.assertIn("</thinking>", out)
 
     def test_method2_typo_close_tag_branch(self):
-        # ``Random(5).randrange(6) == 4`` hits the spatial closing-tag typo variant.
+        # ``Random(5).randrange(8) == 4`` hits the spatial closing-tag typo variant.
         rng = random.Random(5)
         out = build_format_break_rejected(M2_FULL, "method2", rng)
         assert out is not None
         self.assertIn("with_boxess", out.replace(" ", "").lower())
+
+    def test_variant_plain_text_no_contract_tags(self):
+        # ``Random(0).randrange(8) == 6`` — prose only, no ``<risk_factors>`` / ``<logic>`` / ``<response>``.
+        rng = random.Random(0)
+        out = build_format_break_rejected(M1_FULL_A, "method1", rng)
+        assert out is not None
+        self.assertIn("Risk notes (unstructured):", out)
+        self.assertNotIn("<risk_factors>", out)
+        self.assertNotIn("<logic>", out)
+        self.assertNotIn("<response>", out)
+
+    def test_variant_stray_half_tags(self):
+        # ``Random(9).randrange(8) == 7`` — orphan closers + truncated open + pseudo markers.
+        rng = random.Random(9)
+        out = build_format_break_rejected(M1_FULL_A, "method1", rng)
+        assert out is not None
+        self.assertIn("</risk_factors>", out)
+        self.assertIn("<logi", out)
+        self.assertIn("[[RESPONSE]]", out)
 
 
 class TestRiskPerturb(unittest.TestCase):

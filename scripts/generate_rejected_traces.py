@@ -8,8 +8,8 @@ Fill ``rejected_reasoning_trace`` for VG-SPV DPO CSVs using:
   - **risk_perturb**: wrong ``<risk_factors>`` / ``<risk_factors_with_boxes>`` content only
     (false ``no risk``, plausible false positives, or **confusable** substitutes like
     ``knife`` -> ``butter knife``); ``<logic>`` / ``<response>`` stay **verbatim** from chosen.
-  - **format_break**: same text blobs as chosen but **broken markup** (wrong tag names, bad closers,
-    wrong segment order, preamble, or truncated open tags) for format-fail / ``alpha_format`` training.
+  - **format_break**: **broken markup** and **non-XML** negatives (wrong tags, bad closers, preamble,
+    truncated opens, **plain prose with no tags**, or **stray / half-tags** with orphan closers).
 
 **Logic / response handling (by design)**:
   - ``risk_perturb`` / ``bbox_perturb``: logic + response **unchanged** from chosen (only risk/boxes wrong).
