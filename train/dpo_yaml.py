@@ -28,9 +28,8 @@ class DPOTrainConfig:
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 8
     learning_rate: float = 5e-5
-    # Cap full sequence length for DPO (chosen/rejected completions); raise if long XML traces truncate.
+    # TRL DPOConfig: single token cap for the full sequence (prompt + completion); no separate max_prompt_length.
     max_length: int = 8192
-    max_prompt_length: int = 2048
     beta: float = 0.1
     bf16: bool = True
     ref_8bit: bool = False

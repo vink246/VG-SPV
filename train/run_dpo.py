@@ -59,7 +59,6 @@ def parse_args() -> argparse.Namespace:
     add("gradient_accumulation_steps", int, "")
     add("learning_rate", float, "")
     add("max_length", int, "")
-    add("max_prompt_length", int, "")
     add("beta", float, "DPO temperature")
     add("bf16", _str2bool, "Use bfloat16")
     add("ref_8bit", _str2bool, "Load reference model in 8-bit")
@@ -195,7 +194,7 @@ def main() -> None:
 
     eval_dataset = None
     if cfg.eval_data_path:
-        eval_dataset = load_dpo_dataset(cfg.eval_data_path, prompt_instruction=pi)
+        eval_dataset = load_dpo_dataset(cfg.eval_data_path, prompt_instruction=pi, csv_hf_split="test")
 
     training_args = DPOConfig(
         output_dir=cfg.output_dir,
@@ -205,7 +204,6 @@ def main() -> None:
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         max_length=cfg.max_length,
-        max_prompt_length=cfg.max_prompt_length,
         beta=cfg.beta,
         bf16=cfg.bf16,
         logging_steps=cfg.logging_steps,

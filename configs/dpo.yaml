@@ -14,9 +14,8 @@ num_train_epochs: 1
 per_device_train_batch_size: 4
 gradient_accumulation_steps: 8
 learning_rate: 5.0e-5
-# Long rejected traces (e.g. verbose abliterated responses) need headroom; vision models also use prompt tokens.
+# Token cap for the full sequence (TRL DPOConfig.max_length only; max_prompt_length removed in recent trl).
 max_length: 8192
-max_prompt_length: 2048
 beta: 0.1
 bf16: true
 ref_8bit: false

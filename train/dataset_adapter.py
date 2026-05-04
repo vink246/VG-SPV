@@ -85,6 +85,8 @@ def get_example_dpo_dataset() -> Dataset:
 def load_dpo_dataset(
     path_or_name: str | None = None,
     prompt_instruction: str = DEFAULT_PROMPT_INSTRUCTION,
+    *,
+    csv_hf_split: str = "train",
 ) -> Dataset:
     """
     Load a dataset and convert to DPO contract.
@@ -92,6 +94,9 @@ def load_dpo_dataset(
     - If path_or_name is None: returns the minimal example dataset.
     - If path_or_name is a .csv file: loads CSV with columns image, perturbed_image,
       chosen_reasoning_trace, rejected_reasoning_trace and maps to DPO columns.
+      ``csv_hf_split`` sets the HuggingFace split name for that file (CSV only); the
+      library logs ``Generating <split> split``. Default ``train``; use ``test`` for
+      eval/test CSVs so the second load is not mislabeled as train.
     - If path_or_name is a directory: loads from disk (e.g. saved Dataset).
     - Otherwise: treats as HuggingFace dataset name and loads "train" split.
 
@@ -103,7 +108,9 @@ def load_dpo_dataset(
     path = Path(path_or_name)
     if path.suffix.lower() == ".csv":
         from datasets import load_dataset
-        ds = load_dataset("csv", data_files=str(path), split="train")
+
+        split = csv_hf_split.strip() or "train"
+        ds = load_dataset("csv", data_files={split: str(path)}, split=split)
         # Normalize column names: "perturbed image" -> perturbed_image, etc.
         def norm(s: str) -> str:
             return s.replace(" ", "_").strip().lower()

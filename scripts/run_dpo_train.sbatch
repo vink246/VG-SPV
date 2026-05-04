@@ -70,9 +70,8 @@ NUM_TRAIN_EPOCHS=10
 PER_DEVICE_TRAIN_BATCH_SIZE=4
 GRADIENT_ACCUMULATION_STEPS=8
 LEARNING_RATE="5.0e-5"
-# Long rejected traces (verbose abliterated responses); VL prompts also consume tokens.
+# Full-sequence token cap (TRL DPOConfig.max_length); long rejected traces / VL need headroom.
 MAX_LENGTH=8192
-MAX_PROMPT_LENGTH=2048
 BETA="0.1"
 BF16="true"
 REF_8BIT="false"
@@ -157,7 +156,6 @@ conda run -n vg-spv --no-capture-output python -u train/run_dpo.py \
     --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
     --learning-rate             "${LEARNING_RATE}" \
     --max-length                "${MAX_LENGTH}" \
-    --max-prompt-length         "${MAX_PROMPT_LENGTH}" \
     --beta                      "${BETA}" \
     --bf16                      "${BF16}" \
     --ref-8bit                  "${REF_8BIT}" \
