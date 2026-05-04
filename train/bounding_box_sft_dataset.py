@@ -174,7 +174,8 @@ def infer_norm_boxes_from_row(row: dict[str, Any], image: Any) -> list[tuple[flo
     - If ``bbox`` is a list of four-number boxes (some hubs), returns each normalized box.
     - If ``bboxes`` / ``boxes`` / ``gt_boxes`` / ``bbox_list`` holds a list of boxes, uses that.
     - Otherwise a single flat ``bbox`` (length 4) yields a one-element list.
-    - PaDT-style ``objects`` dict with ``value`` list of ``{bbox, label}`` is also supported.
+    - PaDT-style ``objects``: a **list** of ``{bbox, label, …}``, or a **dict** with a ``value`` / ``instances``
+      list of the same shape.
     """
     w, h = _pil_size(image)
     for key in ("bboxes", "boxes", "gt_boxes", "bbox_list"):
@@ -223,28 +224,40 @@ def infer_norm_boxes_from_row(row: dict[str, Any], image: Any) -> list[tuple[flo
     return []
 
 
+def _boxes_from_object_items(
+    items: list[Any], w: int, h: int
+) -> list[tuple[float, float, float, float]]:
+    out: list[tuple[float, float, float, float]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        bb = item.get("bbox")
+        if not isinstance(bb, (list, tuple)) or len(bb) < 4:
+            continue
+        t = _norm_xyxy_one([float(x) for x in bb[:4]], w, h)
+        if t is not None:
+            out.append(t)
+    return out
+
+
 def _infer_norm_boxes_from_objects(
     row: dict[str, Any], w: int, h: int
 ) -> list[tuple[float, float, float, float]]:
-    """PaDT-style ``objects.value[]`` entries with ``bbox`` (often normalized xyxy)."""
+    """PaDT-style ``objects``: list of ``{bbox, label, ...}``, or dict with ``value`` / ``instances``."""
     o = row.get("objects")
     if o is None:
         return []
     if hasattr(o, "tolist"):
         o = o.tolist()
+    if isinstance(o, list):
+        out = _boxes_from_object_items(o, w, h)
+        if out:
+            return out
+        return []
     if isinstance(o, dict):
         items = o.get("value") or o.get("objects") or o.get("instances")
         if isinstance(items, list):
-            out: list[tuple[float, float, float, float]] = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                bb = item.get("bbox")
-                if not isinstance(bb, (list, tuple)) or len(bb) < 4:
-                    continue
-                t = _norm_xyxy_one([float(x) for x in bb[:4]], w, h)
-                if t is not None:
-                    out.append(t)
+            out = _boxes_from_object_items(items, w, h)
             if out:
                 return out
         bb = o.get("bbox")
