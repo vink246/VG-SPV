@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 import traceback
 from pathlib import Path
@@ -37,7 +38,12 @@ class BoundingBoxSFTTrainer(Trainer):
 
     def _save_checkpoint(self, model, trial, metrics=None):
         try:
-            return super()._save_checkpoint(model, trial, metrics=metrics)
+            # ``Trainer._save_checkpoint`` gained ``metrics`` in newer transformers; older
+            # versions only accept ``(model, trial)``.
+            parent_sig = inspect.signature(Trainer._save_checkpoint)
+            if "metrics" in parent_sig.parameters:
+                return super()._save_checkpoint(model, trial, metrics=metrics)
+            return super()._save_checkpoint(model, trial)
         except (OSError, RuntimeError) as e:
             print(
                 f"[bbox_sft] WARNING: checkpoint save failed; training continues. ({type(e).__name__}: {e})",
