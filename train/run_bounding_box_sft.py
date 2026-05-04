@@ -13,8 +13,10 @@ Requires: torch, transformers, peft, datasets, accelerate, pillow.
 Default HF REC source is **PaDT-MLLM/RefCOCO** (``--dataset_id``). When
 ``data/mm-safebench_1/extracted_data/traces/train_method2.csv`` exists, it is **mixed into training**
 with PaDT at ``--vgspv_mix_fraction`` (default **0.25**). Default eval adds ``test_method2.csv`` for
-``eval_loss``. Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` to point at other VG-fDPO-style CSVs; use
-``--no_vgspv_csv`` or ``--skip_eval`` to turn those off.
+``eval_loss``. When both HF eval and an eval CSV exist, validation uses a **fixed balanced subset**
+(100 COCO HF + 100 VG-fDPO CSV by default, reproducible with ``--mix_seed``). Use ``--eval_no_balanced_subset``
+for the full concatenated eval sets. Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` for paths; ``--no_vgspv_csv``
+or ``--skip_eval`` to disable those sides.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -34,6 +37,7 @@ from transformers import Trainer, TrainerCallback
 
 from train.bounding_box_sft_collator import BoundingBoxSFTCollator
 from train.bounding_box_sft_dataset import load_bbox_sft_hf_datasets, load_vgspv_csv_rows_for_sft
+from train.bounding_box_sft_eval_sampling import EVAL_BALANCE_SEED_OFFSET, subsample_balanced_eval
 from train.bounding_box_sft_schema import BOX_COORD_SCALE
 from train.bounding_box_sft_torch_dataset import BoundingBoxSFTConcatEvalDataset, BoundingBoxSFTMixedIndexDataset
 from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION
@@ -44,6 +48,28 @@ from vlm import load_vlm
 _DEFAULT_MM_TRAIN_CSV = _REPO_ROOT / "data/mm-safebench_1/extracted_data/traces/train_method2.csv"
 _DEFAULT_MM_EVAL_CSV = _REPO_ROOT / "data/mm-safebench_1/extracted_data/traces/test_method2.csv"
 _EVAL_SPLIT_FALLBACKS = ("val", "validation", "test")
+
+
+def _print_training_device_banner(loaded) -> None:
+    """Log whether CUDA (or MPS) is available and where the model sits."""
+    m = loaded.model
+    try:
+        dev = next(m.parameters()).device
+    except StopIteration:
+        dev = torch.device("cpu")
+    line = "=" * 64
+    print(line)
+    if torch.cuda.is_available():
+        n = torch.cuda.device_count()
+        print(f"GPU: CUDA is available ({n} device(s))")
+        for i in range(n):
+            print(f"  cuda:{i} — {torch.cuda.get_device_name(i)}")
+    else:
+        print("GPU: CUDA is not available on this machine.")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print("GPU: Apple MPS backend is available (model may still be on CPU/CUDA depending on load).")
+    print(f"Model parameter device: {dev}")
+    print(line)
 
 
 def _save_peft_bundle(model: torch.nn.Module, tokenizer, processor, dest: Path) -> None:
@@ -242,7 +268,20 @@ def parse_args() -> argparse.Namespace:
         "--eval_max_samples",
         type=int,
         default=None,
-        help="Cap HF eval rows after loading (None = all).",
+        help="Max HF eval rows kept as pool before balanced subsampling (None = all loaded rows). Ignored for "
+        "balanced subset sizing unless this caps the pool first.",
+    )
+    p.add_argument(
+        "--eval_balanced_per_side",
+        type=int,
+        default=100,
+        help="When HF eval and eval CSV both exist (and --eval_no_balanced_subset is off), sample this many "
+        "rows from each (default 100+100=200 total).",
+    )
+    p.add_argument(
+        "--eval_no_balanced_subset",
+        action="store_true",
+        help="Disable 50-50 subsampled eval; use full HF eval + full eval CSV concatenated instead.",
     )
     p.add_argument(
         "--eval_steps",
@@ -308,6 +347,7 @@ def main() -> None:
 
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     loaded = load_vlm(args.model_name, dtype=dtype, model_family=args.model_family)
+    _print_training_device_banner(loaded)
     if loaded.family in ("tinyllava",):
         raise SystemExit(
             "Bounding-box SFT trainer currently supports HF processor models (llava, mllama, qwen3_vl). "
@@ -354,6 +394,7 @@ def main() -> None:
             print(f"HF eval: hub split {eval_split_used!r} ({len(hf_eval_ds)} rows).")
         if args.eval_max_samples is not None and len(hf_eval_ds) > int(args.eval_max_samples):
             hf_eval_ds = hf_eval_ds.select(range(int(args.eval_max_samples)))
+            print(f"HF eval: capped pool to --eval_max_samples={int(args.eval_max_samples)} rows.")
     else:
         hf_eval_ds = None
 
@@ -395,6 +436,32 @@ def main() -> None:
     csv_eval_rows: list | None = None
     if eval_csv_path is not None:
         csv_eval_rows = load_vgspv_csv_rows_for_sft(str(eval_csv_path), image_root=img_root)
+
+    if (
+        not args.skip_eval
+        and hf_eval_ds is not None
+        and csv_eval_rows
+        and not args.eval_no_balanced_subset
+    ):
+        per = max(1, int(args.eval_balanced_per_side))
+        hf_eval_ds, csv_eval_rows = subsample_balanced_eval(
+            hf_eval_ds,
+            csv_eval_rows,
+            seed=int(args.mix_seed),
+            n_per_side=per,
+        )
+        eval_balanced_meta = {
+            "enabled": True,
+            "per_side_requested": per,
+            "per_side_used": len(hf_eval_ds),
+            "total_eval_examples": len(hf_eval_ds) + len(csv_eval_rows),
+            "mix_seed": int(args.mix_seed),
+            "seed_offset": EVAL_BALANCE_SEED_OFFSET,
+        }
+    elif not args.skip_eval and hf_eval_ds is not None and csv_eval_rows and args.eval_no_balanced_subset:
+        eval_balanced_meta = {"enabled": False, "reason": "eval_no_balanced_subset"}
+    else:
+        eval_balanced_meta = {"enabled": False}
 
     eval_ds: BoundingBoxSFTConcatEvalDataset | None = None
     if not args.skip_eval:
@@ -519,6 +586,9 @@ def main() -> None:
         "eval_split_used": eval_split_used,
         "hf_eval_holdout_fraction": float(args.hf_eval_holdout_fraction),
         "eval_max_samples": args.eval_max_samples,
+        "eval_balanced_subset": eval_balanced_meta,
+        "eval_balanced_per_side": args.eval_balanced_per_side,
+        "eval_no_balanced_subset": bool(args.eval_no_balanced_subset),
         "eval_steps": (int(args.eval_steps) if args.eval_steps is not None else max(int(args.logging_steps), 50))
         if eval_ds and len(eval_ds) > 0
         else None,
