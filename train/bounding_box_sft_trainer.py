@@ -19,12 +19,18 @@ class BoundingBoxSFTTrainer(Trainer):
     def __init__(
         self,
         *args,
+        bbox_tokenizer: Any | None = None,
         bbox_peft_save: Callable[[Any, Any, Any, Path], None] | None = None,
         bbox_adapter_latest_dir: Path | str | None = None,
         bbox_processor: Any | None = None,
         **kwargs,
     ):
+        # ``tokenizer=...`` support in ``Trainer.__init__`` varies across transformers releases.
+        # Consume it here so callers on older/newer versions do not crash with unexpected kwargs.
+        if bbox_tokenizer is None and "tokenizer" in kwargs:
+            bbox_tokenizer = kwargs.pop("tokenizer")
         super().__init__(*args, **kwargs)
+        self._bbox_tokenizer = bbox_tokenizer
         self._bbox_peft_save = bbox_peft_save
         self._bbox_adapter_latest = Path(bbox_adapter_latest_dir) if bbox_adapter_latest_dir else None
         self._bbox_processor = bbox_processor
@@ -45,7 +51,7 @@ class BoundingBoxSFTTrainer(Trainer):
     def _try_mirror_peft_only(self, model) -> None:
         if self._bbox_peft_save is None or self._bbox_adapter_latest is None:
             return
-        tok = self.tokenizer
+        tok = self._bbox_tokenizer
         if tok is None:
             print("[bbox_sft] WARNING: no tokenizer on trainer; skipping PEFT mirror.", file=sys.stderr, flush=True)
             return

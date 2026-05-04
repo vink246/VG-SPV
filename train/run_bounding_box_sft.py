@@ -590,7 +590,7 @@ def main() -> None:
         eval_dataset=eval_dataset_arg,
         data_collator=collator,
         callbacks=callbacks,
-        tokenizer=loaded.tokenizer,
+        bbox_tokenizer=loaded.tokenizer,
         bbox_peft_save=_save_peft_bundle,
         bbox_adapter_latest_dir=adapter_latest,
         bbox_processor=loaded.processor,

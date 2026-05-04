@@ -327,21 +327,24 @@ MODEL_NAME=meta-llama/Llama-3.2-11B-Vision-Instruct OUTPUT_DIR=outputs/bbox_sft_
 #   --hf_local_files_only
 # (PaDT: do not add --extra_dataset PaDT-MLLM/RefCOCOPlus — use --dataset_id PaDT-MLLM/RefCOCO only.)
 
-# Or invoke Python directly (Windows-friendly)
-python train/run_bounding_box_sft.py ^
-  --model_name llava-hf/llava-v1.6-mistral-7b-hf ^
-  --dataset_id PaDT-MLLM/RefCOCO --split train ^
+# Or invoke Python directly
+python train/run_bounding_box_sft.py \
+  --model_name llava-hf/llava-v1.6-mistral-7b-hf \
+  --dataset_id PaDT-MLLM/RefCOCO --split train \
   --output_dir outputs/bbox_sft_llava --bf16 --gradient_checkpointing
 
 # Explicit MM-SafetyBench paths and mix (same as defaults when those files exist under the repo)
-python train/run_bounding_box_sft.py --model_name meta-llama/Llama-3.2-11B-Vision-Instruct ^
-  --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv ^
-  --vgspv_eval_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv ^
+python train/run_bounding_box_sft.py \
+  --model_name meta-llama/Llama-3.2-11B-Vision-Instruct \
+  --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv \
+  --vgspv_eval_csv data/mm-safebench_1/extracted_data/traces/test_method2.csv \
   --vgspv_mix_fraction 0.25 --save_every_steps 200 --bf16 --gradient_checkpointing
 
 # Resume LoRA training from a saved adapter (base must match --model_name)
-python train/run_bounding_box_sft.py --model_name llava-hf/llava-v1.6-mistral-7b-hf ^
-  --resume_adapter_path outputs/bbox_sft_llava/adapter_latest --output_dir outputs/bbox_sft_llava_cont
+python train/run_bounding_box_sft.py \
+  --model_name llava-hf/llava-v1.6-mistral-7b-hf \
+  --resume_adapter_path outputs/bbox_sft_llava/adapter_latest \
+  --output_dir outputs/bbox_sft_llava_cont
 ```
 
 Full flag reference (`python train/run_bounding_box_sft.py --help` is authoritative):
@@ -371,9 +374,9 @@ Artifacts:
 Use **`--lora_adapter`** pointing at **`adapter/`** (final) or **`adapter_latest/`** (last periodic save).
 
 ```bash
-python eval/run_bounding_box_sft_eval.py ^
-  --model_name llava-hf/llava-v1.6-mistral-7b-hf ^
-  --lora_adapter outputs/bbox_sft_llava/adapter ^
+python eval/run_bounding_box_sft_eval.py \
+  --model_name llava-hf/llava-v1.6-mistral-7b-hf \
+  --lora_adapter outputs/bbox_sft_llava/adapter \
   --dataset_id lmms-lab/RefCOCO --split val --max_samples 500 --bf16
 ```
 
@@ -384,7 +387,7 @@ The script reports **`mean_iou_mean_max_per_gt`** (average over GT boxes of the 
 `--lora-adapter` accepts the same PEFT directory as training: **`adapter/`** or **`adapter_latest/`**.
 
 ```bash
-python inference/run_inference.py --model meta-llama/Llama-3.2-11B-Vision-Instruct ^
+python inference/run_inference.py --model meta-llama/Llama-3.2-11B-Vision-Instruct \
   --lora-adapter outputs/bbox_sft_llama/adapter --image path/to/img.jpg --prompt "Your task prompt here"
 ```
 
@@ -393,7 +396,7 @@ Use `--merge-lora-adapter` to fuse LoRA into dense weights before generation (op
 **5) VG-fDPO (after bbox SFT) with the same adapter:**
 
 ```bash
-python train/run_dpo.py --model_name llava-hf/llava-v1.6-mistral-7b-hf ^
+python train/run_dpo.py --model_name llava-hf/llava-v1.6-mistral-7b-hf \
   --lora_adapter_path outputs/bbox_sft_llava/adapter --data_path data/sample_dpo_data.csv --bf16
 ```
 
