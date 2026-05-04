@@ -11,27 +11,20 @@
 #SBATCH --mail-user=%u@gatech.edu
 #
 # ============================================================================
-# Bounding-box SFT (LoRA) SLURM dispatcher.
+# Bounding-box SFT (LoRA) on MM-SafetyBench Method-2 CSV traces.
 #
 # Submit from the repo root:
 #   sbatch scripts/run_bbox_sft.sbatch
 #
-# Notes:
-# - This script writes periodic HF step checkpoints under OUTPUT_DIR, but the
-#   training code is configured to keep only the *latest* checkpoint folder
-#   (save_total_limit=1). The PEFT crash-recovery bundle is also written to
-#   OUTPUT_DIR/adapter_latest/ (overwritten each save).
-# - Default training mode matches Method-2 / VG-SPV CSV-only SFT (see knobs):
-#     --vgspv_csv … --vgspv_csv_supervised_only --max_samples 1
-# - Checkpoints: omit --save_every_steps (default 0) for HF save + eval_loss each epoch.
-#   Set SAVE_EVERY_STEPS>0 only if you want step-based saves instead.
+# Each epoch: HF checkpoint (adapter weights; optimizer optional) + eval_loss on
+# VGSPV_EVAL_CSV. Default save_total_limit=0 in the Python script keeps every epoch checkpoint.
+# adapter_latest/ is refreshed on each save (crash recovery).
 # ============================================================================
 
 set -euo pipefail
 
 mkdir -p logs
 
-# If your cluster uses modules, keep this; otherwise it is harmless to delete.
 module load cuda/12.1.1 || true
 
 # ----------------------------------------------------------------------------
@@ -40,31 +33,23 @@ module load cuda/12.1.1 || true
 
 MODEL_NAME="meta-llama/Llama-3.2-11B-Vision-Instruct"
 
-# If resuming, set to an existing PEFT adapter directory (e.g. checkpoint-200/ or adapter_latest/).
-# Leave empty to start a fresh LoRA run.
 RESUME_ADAPTER_PATH=""
 
 OUTPUT_DIR="outputs/bbox_sft_llama"
 
-# Method-2 train CSV (MM-SafetyBench traces). Use --vgspv_csv_supervised_only so each epoch
-# walks this CSV only (PaDT not sampled for train); --max_samples 1 caps HF train load size.
 VGSPV_CSV="data/mm-safebench_1/extracted_data/traces/train_method2.csv"
 VGSPV_EVAL_CSV="data/mm-safebench_1/extracted_data/traces/test_method2.csv"
-MAX_HF_TRAIN_SAMPLES=1
-# Stop if eval_loss does not improve for this many consecutive eval runs (0 = off).
+
 EVAL_EARLY_STOPPING_PATIENCE=3
 
-# Step-based HF saves (optional). Leave 0 for per-epoch save + eval (default in train script).
 SAVE_EVERY_STEPS=0
 
-# Training hyperparams (adjust as needed)
 EPOCHS=1
 PER_DEVICE_TRAIN_BS=1
 GRAD_ACCUM=8
 LR="2e-4"
 WARMUP_RATIO="0.03"
 
-# Dtype/device flags
 BF16="--bf16"
 GRAD_CKPT="--gradient_checkpointing"
 
@@ -81,16 +66,11 @@ echo "OUTPUT_DIR   : ${OUTPUT_DIR}"
 echo "VGSPV_CSV    : ${VGSPV_CSV}"
 echo "VGSPV_EVAL   : ${VGSPV_EVAL_CSV}"
 echo "EVAL_ES_PAT  : ${EVAL_EARLY_STOPPING_PATIENCE}"
-echo "CSV_ONLY     : vgspv_csv_supervised_only + max_samples=${MAX_HF_TRAIN_SAMPLES}"
+echo "SAVE_STEPS   : ${SAVE_EVERY_STEPS} (0 = per-epoch checkpoint + val loss)"
 echo "RESUME       : ${RESUME_ADAPTER_PATH:-<none>}"
-echo "SAVE_STEPS   : ${SAVE_EVERY_STEPS} (0 = per-epoch save+eval)"
 echo "================="
 nvidia-smi -L 2>/dev/null || echo "  (nvidia-smi not available)"
 echo "================="
-
-# ----------------------------------------------------------------------------
-# Train
-# ----------------------------------------------------------------------------
 
 RESUME_ARGS=()
 if [[ -n "${RESUME_ADAPTER_PATH}" ]]; then
@@ -101,8 +81,6 @@ conda run -p ~/scratch/envs/vg-spv --no-capture-output python -u train/run_bound
   --model_name "${MODEL_NAME}" \
   --vgspv_csv "${VGSPV_CSV}" \
   --vgspv_eval_csv "${VGSPV_EVAL_CSV}" \
-  --vgspv_csv_supervised_only \
-  --max_samples "${MAX_HF_TRAIN_SAMPLES}" \
   --eval_early_stopping_patience "${EVAL_EARLY_STOPPING_PATIENCE}" \
   --output_dir "${OUTPUT_DIR}" \
   --epochs "${EPOCHS}" \
@@ -114,4 +92,3 @@ conda run -p ~/scratch/envs/vg-spv --no-capture-output python -u train/run_bound
   ${BF16} \
   ${GRAD_CKPT} \
   "${RESUME_ARGS[@]}"
-

@@ -14,7 +14,11 @@ _DATASETS = importlib.util.find_spec("datasets") is not None
 def test_vgspv_csv_uses_per_row_prompt(tmp_path: Path) -> None:
     from PIL import Image
 
-    from train.bounding_box_sft_dataset import load_vgspv_csv_rows_for_sft, vgspv_csv_row_to_bbox_sft_sample
+    from train.bounding_box_sft_dataset import (
+        load_vgspv_csv_rows_for_sft,
+        vgspv_csv_row_to_bbox_sft_sample,
+        vgspv_csv_row_to_eval_user_messages,
+    )
     from train.dataset_adapter import CHOSEN_REASONING_TRACE_COL, DPO_PROMPT_COL, IMAGE_COL
 
     img = tmp_path / "x.png"
@@ -34,6 +38,11 @@ def test_vgspv_csv_uses_per_row_prompt(tmp_path: Path) -> None:
     u1 = s1.messages[0]["content"][1]["text"]
     assert u0 == "Ask A"
     assert u1 == "Ask B"
+
+    ev0 = vgspv_csv_row_to_eval_user_messages(rows[0], "FALLBACK")
+    assert len(ev0) == 1
+    assert ev0[0]["role"] == "user"
+    assert ev0[0]["content"][1]["text"] == u0
 
 
 @pytest.mark.skipif(not _DATASETS, reason="datasets not installed")

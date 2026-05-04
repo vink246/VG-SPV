@@ -1,31 +1,25 @@
 """
 LoRA supervised finetuning: teach a VLM to emit `<risk_factors_with_boxes>` + grid-normalized coords.
 
-Run from repo root:
-  python train/run_bounding_box_sft.py --model_name llava-hf/llava-v1.6-mistral-7b-hf --output_dir outputs/bbox_sft_llava
+Training and validation use **MM-SafetyBench / VG-SPV CSV traces** only (Method-2 style: ``image``,
+``prompt``, ``chosen_reasoning_trace``).
 
-Saved layout (compatible with `inference/run_inference.py --lora-adapter` and `train/run_dpo.py --lora_adapter_path`):
+Run from repo root:
+  python train/run_bounding_box_sft.py --model_name meta-llama/Llama-3.2-11B-Vision-Instruct \\
+    --output_dir outputs/bbox_sft_llama
+
+Saved layout (compatible with ``inference/run_inference.py --lora-adapter`` and ``train/run_dpo.py``):
   ``{output_dir}/adapter`` — final PEFT weights + tokenizer/processor
   ``{output_dir}/adapter_latest`` — overwritten on each periodic save (crash recovery)
 
+With ``--save_every_steps 0`` (default): **HF checkpoint + eval_loss at the end of every epoch**.
+Use ``--save_every_steps N`` for step-based saves and aligned eval (see ``--eval_steps``).
+
+Checkpoints default to **not** saving the optimizer (``save_only_model``). Use ``--save_optimizer_state``
+for full HF resume state. Failed checkpoint writes still mirror PEFT to ``adapter_latest/`` when possible
+(``BoundingBoxSFTTrainer``).
+
 Requires: torch, transformers, peft, datasets, accelerate, pillow.
-
-Default HF REC source is **PaDT-MLLM/RefCOCO** (``--dataset_id``). When
-``data/mm-safebench_1/extracted_data/traces/train_method2.csv`` exists, it is **mixed into training**
-with PaDT at ``--vgspv_mix_fraction`` (default **0.25**). By default **``--save_every_steps 0``** enables
-**per-epoch HF checkpoints** and **``eval_loss`` after each epoch** (aligned saves). Use **``--save_every_steps N``**
-for step-based saves + step eval instead. With ``--vgspv_csv_supervised_only`` and a resolvable eval CSV
-(``--vgspv_eval_csv`` or default ``test_method2.csv``), **eval_loss uses the test CSV only** (PaDT val eval
-is skipped). Otherwise default eval adds ``test_method2.csv`` alongside HF eval; when both exist,
-validation may use a **balanced subset** (100+100 by default; use ``--eval_no_balanced_subset`` for full
-concat). ``--eval_early_stopping_patience`` stops after that many evals with no ``eval_loss`` improvement
-(**epochs** when using per-epoch eval). Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` for paths;
-``--no_vgspv_csv`` or ``--skip_eval`` to disable those sides.
-
-Checkpoints default to **not** saving the optimizer (``save_only_model``), which avoids huge
-``optimizer.pt`` writes that often hit disk quota on NFS/home. Use ``--save_optimizer_state`` only if
-you need full HF resume state. If a checkpoint write still fails, training continues and the LoRA
-bundle is mirrored to ``adapter_latest/`` when possible (``BoundingBoxSFTTrainer``).
 """
 
 from __future__ import annotations
@@ -45,12 +39,11 @@ from peft import PeftModel
 from transformers import EarlyStoppingCallback, TrainerCallback
 
 from train.bounding_box_sft_collator import BoundingBoxSFTCollator
-from train.bounding_box_sft_dataset import load_bbox_sft_hf_datasets, load_vgspv_csv_rows_for_sft
-from train.bounding_box_sft_eval_sampling import EVAL_BALANCE_SEED_OFFSET, subsample_balanced_eval
+from train.bounding_box_sft_dataset import load_vgspv_csv_rows_for_sft
 from train.bounding_box_sft_schema import BOX_COORD_SCALE
-from train.bounding_box_sft_torch_dataset import BoundingBoxSFTConcatEvalDataset, BoundingBoxSFTMixedIndexDataset
-from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION
+from train.bounding_box_sft_torch_dataset import BoundingBoxSFTCsvEvalDataset, BoundingBoxSFTCsvTrainDataset
 from train.bounding_box_sft_trainer import BoundingBoxSFTTrainer
+from train.dataset_adapter import DEFAULT_PROMPT_INSTRUCTION
 from train.hf_training_args_compat import (
     apply_epoch_eval_scheduling_kwargs,
     apply_eval_scheduling_kwargs,
@@ -61,7 +54,6 @@ from vlm import load_vlm
 
 _DEFAULT_MM_TRAIN_CSV = _REPO_ROOT / "data/mm-safebench_1/extracted_data/traces/train_method2.csv"
 _DEFAULT_MM_EVAL_CSV = _REPO_ROOT / "data/mm-safebench_1/extracted_data/traces/test_method2.csv"
-_EVAL_SPLIT_FALLBACKS = ("val", "validation", "test")
 
 
 def _print_training_device_banner(loaded) -> None:
@@ -143,12 +135,12 @@ class SaveEveryNEpochsCallback(TrainerCallback):
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Bounding-box SFT (LoRA) for VG-SPV.")
+    p = argparse.ArgumentParser(description="Bounding-box SFT (LoRA) on MM-SafetyBench / VG-SPV CSV traces.")
     p.add_argument(
         "--model_name",
         type=str,
         required=True,
-        help="HF model id or local path (base weights), e.g. llava-hf/llava-v1.6-mistral-7b-hf.",
+        help="HF model id or local path (base weights), e.g. meta-llama/Llama-3.2-11B-Vision-Instruct.",
     )
     p.add_argument(
         "--resume_adapter_path",
@@ -157,71 +149,40 @@ def parse_args() -> argparse.Namespace:
         help="Optional PEFT adapter directory to continue training (same base as --model_name).",
     )
     p.add_argument(
-        "--dataset_id",
-        type=str,
-        default="PaDT-MLLM/RefCOCO",
-        help="Primary HF hub id, or path to save_to_disk REC data (first shard of combined training).",
-    )
-    p.add_argument(
-        "--extra_dataset",
-        action="append",
-        default=[],
-        metavar="ID_OR_PATH",
-        help="Additional hub id or save_to_disk path (repeatable). Concatenated after --dataset_id when schemas match. "
-        "PaDT: use only PaDT-MLLM/RefCOCO (it already includes refcoco+ / refcocog data); separate PaDT RefCOCO+ hubs are often absent.",
-    )
-    p.add_argument(
-        "--dataset_config",
-        type=str,
-        default=None,
-        help="Optional HF builder config (``name=``). PaDT RefCOCO hubs on recent ``datasets`` expose "
-        "``default`` only — omit this flag or pass ``default``. Wrong names raise ValueError (available configs).",
-    )
-    p.add_argument("--split", type=str, default="train", help="Dataset split (PaDT RefCOCO uses `train`).")
-    p.add_argument(
-        "--hf_local_files_only",
-        action="store_true",
-        help="Hub loads only: pass DownloadConfig(local_files_only=True) (no network). Set HF_HOME on PACE.",
-    )
-    p.add_argument("--max_samples", type=int, default=None, help="Cap HF dataset size for debugging.")
-    p.add_argument(
         "--vgspv_csv",
         type=str,
         default=None,
-        help="Train VG-fDPO / Method-2 CSV (image, chosen_reasoning_trace with <risk_factors_with_boxes>, …). "
-        "Default: data/mm-safebench_1/extracted_data/traces/train_method2.csv if that file exists.",
+        help="Train CSV (image, prompt, chosen_reasoning_trace, …). Default: train_method2.csv under repo if present.",
     )
     p.add_argument(
-        "--vgspv_mix_fraction",
-        type=float,
-        default=0.25,
-        help="Fraction of train steps from VG-fDPO CSV vs PaDT HF (0–1). E.g. 0.25 ≈ 25%% CSV, 75%% PaDT. "
-        "Ignored when no train CSV is loaded.",
+        "--vgspv_eval_csv",
+        type=str,
+        default=None,
+        help="Validation CSV for eval_loss each epoch (default: test_method2.csv under repo if present).",
     )
     p.add_argument(
         "--vgspv_prompt_instruction",
         type=str,
         default=None,
-        help="Fallback user text when CSV has no `prompt` column (default: DEFAULT_PROMPT_INSTRUCTION).",
+        help="Fallback user text when a row has no `prompt` column (default: DEFAULT_PROMPT_INSTRUCTION).",
     )
     p.add_argument(
         "--vgspv_image_root",
         type=str,
         default=None,
-        help="Optional base dir for resolving relative `image` paths in --vgspv_csv (default: repo root + cwd).",
+        help="Optional base dir for resolving relative `image` paths in CSVs.",
     )
     p.add_argument(
-        "--bbox_hf_image_root",
-        type=str,
-        default=None,
-        help="COCO root for HF basenames (PaDT): directory containing train2014/ (typical), train2017/, etc. "
-        "Default when unset: repo data/coco/ if it exists. Same as env BBOX_SFT_IMAGE_ROOT.",
-    )
-    p.add_argument(
-        "--mix_seed",
+        "--max_train_rows",
         type=int,
-        default=42,
-        help="Seed for deterministic HF vs CSV selection per index.",
+        default=None,
+        help="Cap training rows after load (debug / smoke runs).",
+    )
+    p.add_argument(
+        "--max_eval_rows",
+        type=int,
+        default=None,
+        help="Cap validation rows after load (debug).",
     )
     p.add_argument(
         "--output_dir",
@@ -239,32 +200,26 @@ def parse_args() -> argparse.Namespace:
         "--save_every_steps",
         type=int,
         default=0,
-        help="If > 0: save HF checkpoints every N global steps and run eval on the same step interval. "
-        "If 0 (default): save at end of every epoch and run eval each epoch (val loss per epoch; "
-        "mirrors adapter_latest on each save).",
+        help="If > 0: save HF checkpoints every N global steps and run eval on --eval_steps. "
+        "If 0 (default): save at end of every epoch and run eval_loss each epoch.",
     )
     p.add_argument(
         "--save_every_n_epochs",
         type=int,
         default=0,
         help="When using --save_every_steps > 0 only: additionally call save_model every N completed epochs "
-        "(0 = off). Ignored when --save_every_steps is 0 (epoch-based save already runs each epoch).",
+        "(0 = off). Ignored when --save_every_steps is 0.",
     )
     p.add_argument(
         "--save_total_limit",
         type=int,
-        default=1,
-        help=(
-            "Max full checkpoints to keep under output_dir (oldest removed). "
-            "This script defaults to 1 to avoid accumulating large checkpoint folders. "
-            "adapter_latest is always overwritten."
-        ),
+        default=0,
+        help="Max HF checkpoint folders to keep (oldest removed). 0 = no limit (keep every epoch).",
     )
     p.add_argument(
         "--save_optimizer_state",
         action="store_true",
-        help="Include optimizer/scheduler in HF checkpoints (large; can fill quota and fail mid-run). "
-        "Default is off: only model/adapter weights are checkpointed (see TrainingArguments.save_only_model).",
+        help="Include optimizer/scheduler in HF checkpoints (large). Default: adapter weights only.",
     )
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--max_steps", type=int, default=-1)
@@ -280,79 +235,24 @@ def parse_args() -> argparse.Namespace:
         help="Optional backend override (see vlm/registry.py).",
     )
     p.add_argument(
-        "--eval_split",
-        type=str,
-        default="val",
-        help="HF split for eval loss (tried first, then validation, test). If none load, see --hf_eval_holdout_fraction.",
-    )
-    p.add_argument(
-        "--hf_eval_holdout_fraction",
-        type=float,
-        default=0.02,
-        help="If no HF eval split loads, hold out this fraction of train HF rows for eval (disjoint).",
-    )
-    p.add_argument(
-        "--eval_max_samples",
-        type=int,
-        default=None,
-        help="Max HF eval rows kept as pool before balanced subsampling (None = all loaded rows). Ignored for "
-        "balanced subset sizing unless this caps the pool first.",
-    )
-    p.add_argument(
-        "--eval_balanced_per_side",
-        type=int,
-        default=100,
-        help="When HF eval and eval CSV both exist (and --eval_no_balanced_subset is off), sample this many "
-        "rows from each (default 100+100=200 total).",
-    )
-    p.add_argument(
-        "--eval_no_balanced_subset",
-        action="store_true",
-        help="Disable 50-50 subsampled eval; use full HF eval + full eval CSV concatenated instead.",
-    )
-    p.add_argument(
         "--eval_steps",
         type=int,
         default=None,
-        help="Only when --save_every_steps > 0: run eval every N global steps (default: max(logging_steps, 50)). "
-        "Ignored when --save_every_steps is 0 (eval runs every epoch). Ignored with --skip_eval.",
+        help="Only when --save_every_steps > 0: run eval every N global steps (default: max(logging_steps, 50)).",
     )
     p.add_argument(
         "--eval_early_stopping_patience",
         type=int,
         default=0,
-        help="Stop training after this many eval runs without improvement in eval_loss (0 = disabled). "
-        "When > 0, enables load_best_model_at_end on eval_loss. With --save_every_steps 0, each epoch is one "
-        "eval (patience = epochs without improvement). With --save_every_steps > 0, save_steps align with eval_steps.",
+        help="Stop after this many evals without eval_loss improvement (0 = off). With per-epoch eval, "
+        "one eval per epoch.",
     )
     p.add_argument("--per_device_eval_batch_size", type=int, default=1)
-    p.add_argument("--skip_eval", action="store_true", help="Disable eval loss (train loss only).")
-    p.add_argument(
-        "--vgspv_eval_csv",
-        type=str,
-        default=None,
-        help="CSV for eval (default: test_method2.csv under repo if present).",
-    )
-    p.add_argument(
-        "--no_vgspv_csv",
-        action="store_true",
-        help="Do not mix train_method2.csv even if the default file exists.",
-    )
-    p.add_argument(
-        "--vgspv_csv_supervised_only",
-        action="store_true",
-        help=(
-            "Train only on VG-SPV / Method-2 CSV rows (each step: CSV `prompt` + `chosen_reasoning_trace`). "
-            "Epoch length becomes len(train CSV). RefCOCO-style HF rows are not sampled for training. "
-            "When a test/eval CSV is available (--vgspv_eval_csv or default test_method2.csv), validation "
-            "uses that CSV only (PaDT / HF val eval is skipped). Improves alignment with VG-fDPO prompts."
-        ),
-    )
+    p.add_argument("--skip_eval", action="store_true", help="Disable eval_loss (train only).")
     return p.parse_args()
 
 
 def _resolve_bbox_eval_csv_path(args: argparse.Namespace) -> Path | None:
-    """Eval CSV path if eval is enabled and a file exists; raises if --vgspv_eval_csv is set but missing."""
     if args.skip_eval:
         return None
     if args.vgspv_eval_csv:
@@ -363,39 +263,6 @@ def _resolve_bbox_eval_csv_path(args: argparse.Namespace) -> Path | None:
     if _DEFAULT_MM_EVAL_CSV.is_file():
         return _DEFAULT_MM_EVAL_CSV.resolve()
     return None
-
-
-def _try_load_hf_eval(
-    sources: list[str],
-    preferred_split: str,
-    *,
-    config_name: str | None,
-    local_files_only: bool,
-    max_eval_samples: int | None,
-    image_root: str | None,
-):
-    """Return (dataset, split_name_used) or (None, None)."""
-    order: list[str] = []
-    if preferred_split and preferred_split.strip():
-        order.append(preferred_split.strip())
-    for s in _EVAL_SPLIT_FALLBACKS:
-        if s not in order:
-            order.append(s)
-    for sp in order:
-        try:
-            ds = load_bbox_sft_hf_datasets(
-                sources,
-                sp,
-                max_samples=max_eval_samples,
-                config_name=config_name,
-                local_files_only=local_files_only,
-                image_root=image_root,
-            )
-            if len(ds) > 0:
-                return ds, sp
-        except Exception:
-            continue
-    return None, None
 
 
 def main() -> None:
@@ -416,147 +283,51 @@ def main() -> None:
     if loaded.processor is None:
         raise SystemExit("Bounding-box SFT requires a processor (LLaVA / Mllama / Qwen-VL).")
 
-    sources = [args.dataset_id] + list(args.extra_dataset or [])
-    hf_train_full = load_bbox_sft_hf_datasets(
-        sources,
-        args.split,
-        max_samples=args.max_samples,
-        config_name=args.dataset_config,
-        local_files_only=bool(args.hf_local_files_only),
-        image_root=args.bbox_hf_image_root,
-    )
-
-    eval_csv_path = _resolve_bbox_eval_csv_path(args)
-    csv_supervised_test_csv_eval_only = bool(args.vgspv_csv_supervised_only and eval_csv_path is not None)
-
-    hf_eval_ds = None
-    eval_split_used: str | None = None
-    hf_train = hf_train_full
-    if not args.skip_eval and csv_supervised_test_csv_eval_only:
-        hf_eval_ds = None
-        hf_train = hf_train_full
-        eval_split_used = "vgspv_test_csv_only"
-        print(
-            f"[bbox_sft] CSV-supervised-only: skipping PaDT/HF eval; eval_loss uses test CSV only ({eval_csv_path}).",
-            flush=True,
-        )
-    elif not args.skip_eval:
-        hf_eval_ds, eval_split_used = _try_load_hf_eval(
-            sources,
-            args.eval_split,
-            config_name=args.dataset_config,
-            local_files_only=bool(args.hf_local_files_only),
-            max_eval_samples=args.eval_max_samples,
-            image_root=args.bbox_hf_image_root,
-        )
-        if hf_eval_ds is None or len(hf_eval_ds) == 0:
-            hold = float(args.hf_eval_holdout_fraction)
-            if hold <= 0.0 or hold >= 1.0:
-                raise SystemExit(
-                    "No HF eval split could be loaded; set --hf_eval_holdout_fraction in (0, 1) "
-                    "to hold out part of train, or use --skip_eval."
-                )
-            split_d = hf_train_full.train_test_split(test_size=hold, seed=int(args.mix_seed))
-            hf_train = split_d["train"]
-            hf_eval_ds = split_d["test"]
-            eval_split_used = f"train_holdout_{hold:g}"
-            print(f"HF eval: holdout {hold * 100:.3g}% of train rows (no hub val/validation/test).")
-        else:
-            print(f"HF eval: hub split {eval_split_used!r} ({len(hf_eval_ds)} rows).")
-        if hf_eval_ds is not None and args.eval_max_samples is not None and len(hf_eval_ds) > int(args.eval_max_samples):
-            hf_eval_ds = hf_eval_ds.select(range(int(args.eval_max_samples)))
-            print(f"HF eval: capped pool to --eval_max_samples={int(args.eval_max_samples)} rows.")
-    else:
-        hf_eval_ds = None
-
-    vgspv_prompt = args.vgspv_prompt_instruction or DEFAULT_PROMPT_INSTRUCTION
-    img_root = Path(args.vgspv_image_root).resolve() if args.vgspv_image_root else None
-
-    train_csv_path: Path | None = None
-    if args.no_vgspv_csv:
-        train_csv_path = None
-    elif args.vgspv_csv:
+    if args.vgspv_csv:
         train_csv_path = Path(args.vgspv_csv).expanduser().resolve()
-        if not train_csv_path.is_file():
-            raise SystemExit(f"--vgspv_csv not found: {train_csv_path}")
     elif _DEFAULT_MM_TRAIN_CSV.is_file():
         train_csv_path = _DEFAULT_MM_TRAIN_CSV.resolve()
     else:
-        train_csv_path = None
+        raise SystemExit(
+            f"No train CSV: pass --vgspv_csv or add the default file at {_DEFAULT_MM_TRAIN_CSV}."
+        )
+    if not train_csv_path.is_file():
+        raise SystemExit(f"Train CSV not found: {train_csv_path}")
 
-    csv_rows: list | None = None
-    mix_fraction = 0.0
-    if train_csv_path is not None:
-        csv_rows = load_vgspv_csv_rows_for_sft(str(train_csv_path), image_root=img_root)
-        mix_fraction = float(args.vgspv_mix_fraction)
-        if not args.vgspv_csv_supervised_only and mix_fraction <= 0.0:
-            raise SystemExit("Train VG-SPV CSV is loaded but --vgspv_mix_fraction must be > 0.")
+    img_root = Path(args.vgspv_image_root).resolve() if args.vgspv_image_root else None
+    csv_rows = load_vgspv_csv_rows_for_sft(str(train_csv_path), image_root=img_root)
+    if args.max_train_rows is not None and int(args.max_train_rows) > 0:
+        csv_rows = csv_rows[: int(args.max_train_rows)]
+    print(f"[bbox_sft] Train CSV: {train_csv_path} ({len(csv_rows)} rows)", flush=True)
 
-    if args.vgspv_csv_supervised_only:
-        if not csv_rows:
-            raise SystemExit(
-                "--vgspv_csv_supervised_only requires a train CSV (default train_method2.csv when present, "
-                "or --vgspv_csv). Do not combine with --no_vgspv_csv."
-            )
+    vgspv_prompt = args.vgspv_prompt_instruction or DEFAULT_PROMPT_INSTRUCTION
+
+    eval_csv_path = _resolve_bbox_eval_csv_path(args)
+    csv_eval_rows: list[dict[str, Any]] | None = None
+    if eval_csv_path is not None:
+        csv_eval_rows = load_vgspv_csv_rows_for_sft(str(eval_csv_path), image_root=img_root)
+        if args.max_eval_rows is not None and int(args.max_eval_rows) > 0:
+            csv_eval_rows = csv_eval_rows[: int(args.max_eval_rows)]
+        print(f"[bbox_sft] Eval CSV: {eval_csv_path} ({len(csv_eval_rows)} rows)", flush=True)
+
+    eval_dataset_arg: BoundingBoxSFTCsvEvalDataset | None = None
+    if not args.skip_eval and csv_eval_rows:
+        eval_dataset_arg = BoundingBoxSFTCsvEvalDataset(csv_eval_rows)
+    elif not args.skip_eval:
         print(
-            f"[bbox_sft] CSV-supervised-only: {len(csv_rows)} steps/epoch on Method-2 / VG-SPV rows "
-            "(CSV `prompt` + `chosen_reasoning_trace`). PaDT rows are not sampled for training.",
+            "[bbox_sft] No eval CSV resolved; validation disabled. Set --vgspv_eval_csv or add "
+            f"{_DEFAULT_MM_EVAL_CSV.name} under the repo.",
             flush=True,
         )
 
-    csv_eval_rows: list | None = None
-    if eval_csv_path is not None:
-        csv_eval_rows = load_vgspv_csv_rows_for_sft(str(eval_csv_path), image_root=img_root)
-
-    if (
-        not args.skip_eval
-        and hf_eval_ds is not None
-        and csv_eval_rows
-        and not args.eval_no_balanced_subset
-    ):
-        per = max(1, int(args.eval_balanced_per_side))
-        hf_eval_ds, csv_eval_rows = subsample_balanced_eval(
-            hf_eval_ds,
-            csv_eval_rows,
-            seed=int(args.mix_seed),
-            n_per_side=per,
-        )
-        eval_balanced_meta = {
-            "enabled": True,
-            "per_side_requested": per,
-            "per_side_used": len(hf_eval_ds),
-            "total_eval_examples": len(hf_eval_ds) + len(csv_eval_rows),
-            "mix_seed": int(args.mix_seed),
-            "seed_offset": EVAL_BALANCE_SEED_OFFSET,
-        }
-    elif not args.skip_eval and hf_eval_ds is not None and csv_eval_rows and args.eval_no_balanced_subset:
-        eval_balanced_meta = {"enabled": False, "reason": "eval_no_balanced_subset"}
-    else:
-        eval_balanced_meta = {"enabled": False}
-
-    eval_ds: BoundingBoxSFTConcatEvalDataset | None = None
-    if not args.skip_eval:
-        eval_ds = BoundingBoxSFTConcatEvalDataset(hf_eval_ds, csv_eval_rows)
-        if len(eval_ds) == 0:
-            eval_ds = None
-            print("Eval disabled: empty HF eval and empty eval CSV.")
-
     collator = BoundingBoxSFTCollator(
         loaded.processor,
-        hf_train,
         loaded.family,
-        hf_eval=None if args.skip_eval else hf_eval_ds,
-        csv_rows=csv_rows,
-        csv_eval_rows=None if args.skip_eval else csv_eval_rows,
+        csv_rows,
+        csv_eval_rows=csv_eval_rows if eval_dataset_arg is not None else None,
         vgspv_prompt_instruction=vgspv_prompt,
     )
-    torch_ds = BoundingBoxSFTMixedIndexDataset(
-        hf_train,
-        csv_rows,
-        mix_fraction=mix_fraction if csv_rows else 0.0,
-        seed=args.mix_seed,
-        csv_supervised_only=bool(args.vgspv_csv_supervised_only),
-    )
+    torch_ds = BoundingBoxSFTCsvTrainDataset(csv_rows)
 
     if args.resume_adapter_path:
         normalize_no_split_modules_for_accelerate(loaded.model)
@@ -581,7 +352,10 @@ def main() -> None:
     save_strategy = "steps" if use_step_checkpointing else "epoch"
     save_steps_val = int(args.save_every_steps) if use_step_checkpointing else 0
 
-    targs_kw: dict = dict(
+    save_total_limit_arg = int(args.save_total_limit)
+    save_total_limit_kw: int | None = None if save_total_limit_arg <= 0 else save_total_limit_arg
+
+    targs_kw: dict[str, Any] = dict(
         output_dir=str(out),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -590,25 +364,20 @@ def main() -> None:
         warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps,
         save_strategy=save_strategy,
-        # Keep only the latest HF checkpoint folder to reduce disk churn.
-        # (We also mirror a crash-recovery PEFT bundle to adapter_latest/, which is overwritten.)
-        save_total_limit=1,
+        save_total_limit=save_total_limit_kw,
         bf16=args.bf16,
         fp16=not args.bf16 and dtype == torch.float16,
         max_steps=args.max_steps if args.max_steps > 0 else -1,
         remove_unused_columns=False,
         report_to="none",
         gradient_checkpointing=args.gradient_checkpointing,
-        # Skip optimizer/scheduler in HF checkpoints by default (saves disk; avoids torch.save failures).
         save_only_model=not bool(args.save_optimizer_state),
         save_safetensors=True,
     )
-    # ``save_on_train_end`` exists only on newer ``transformers``; final PEFT is written after
-    # ``trainer.train()`` anyway (``adapter/``, ``adapter_latest/`` + callbacks on_train_end).
     if save_strategy == "steps":
         targs_kw["save_steps"] = save_steps_val
 
-    eval_dataset_arg = eval_ds if eval_ds is not None and len(eval_ds) > 0 else None
+    eval_dataset_final = eval_dataset_arg
     esp = max(0, int(args.eval_early_stopping_patience))
     orig_save_strategy = save_strategy
     orig_save_steps_val = save_steps_val
@@ -616,7 +385,7 @@ def main() -> None:
     eval_steps_effective: int | None = None
     eval_schedule = "steps" if use_step_checkpointing else "epoch"
 
-    if eval_dataset_arg is not None:
+    if eval_dataset_final is not None:
         if use_step_checkpointing:
             eval_steps_effective = int(args.eval_steps) if args.eval_steps is not None else max(
                 int(args.logging_steps), 50
@@ -635,7 +404,7 @@ def main() -> None:
                 eval_steps=int(eval_steps_effective),
                 per_device_eval_batch_size=int(args.per_device_eval_batch_size),
             ):
-                eval_dataset_arg = None
+                eval_dataset_final = None
                 if esp > 0:
                     targs_kw["save_strategy"] = orig_save_strategy
                     if orig_save_strategy == "steps":
@@ -651,7 +420,7 @@ def main() -> None:
                     f"eval/save every {eval_steps_effective} steps; load_best_model_at_end.",
                     flush=True,
                 )
-            if eval_dataset_arg is not None:
+            if eval_dataset_final is not None:
                 print(
                     f"[bbox_sft] Step mode: HF checkpoint + eval_loss every {eval_steps_effective} global steps.",
                     flush=True,
@@ -661,7 +430,7 @@ def main() -> None:
                 targs_kw,
                 per_device_eval_batch_size=int(args.per_device_eval_batch_size),
             ):
-                eval_dataset_arg = None
+                eval_dataset_final = None
             else:
                 print(
                     "[bbox_sft] Epoch mode: HF checkpoint + eval_loss at the end of each epoch.",
@@ -677,7 +446,7 @@ def main() -> None:
                         flush=True,
                     )
 
-    final_has_eval = eval_dataset_arg is not None
+    final_has_eval = eval_dataset_final is not None
 
     targs = instantiate_training_arguments(**targs_kw)
     if not args.save_optimizer_state:
@@ -687,11 +456,15 @@ def main() -> None:
             "Use --save_optimizer_state for full HF state (large).",
             flush=True,
         )
+    if save_total_limit_kw is None:
+        print("[bbox_sft] save_total_limit: none (keep every epoch checkpoint).", flush=True)
+    else:
+        print(f"[bbox_sft] save_total_limit: {save_total_limit_kw}", flush=True)
 
     callbacks: list[TrainerCallback] = [
         SaveAdapterLatestCallback(adapter_latest, loaded.tokenizer, loaded.processor),
     ]
-    if esp > 0 and eval_dataset_arg is not None:
+    if esp > 0 and eval_dataset_final is not None:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=esp))
     epoch_cb: SaveEveryNEpochsCallback | None = None
     if use_step_checkpointing and args.save_every_n_epochs and int(args.save_every_n_epochs) > 0:
@@ -707,7 +480,7 @@ def main() -> None:
         model=model,
         args=targs,
         train_dataset=torch_ds,
-        eval_dataset=eval_dataset_arg,
+        eval_dataset=eval_dataset_final,
         data_collator=collator,
         callbacks=callbacks,
         bbox_tokenizer=loaded.tokenizer,
@@ -727,43 +500,26 @@ def main() -> None:
         "base_model_name": args.model_name,
         "vlm_family": loaded.family,
         "box_format": f"int_grid_{BOX_COORD_SCALE}",
-        "dataset_sources": sources,
-        "dataset_id": args.dataset_id,
-        "extra_dataset": list(args.extra_dataset or []),
-        "dataset_config": args.dataset_config,
-        "hf_local_files_only": bool(args.hf_local_files_only),
-        "split": args.split,
-        "max_samples": args.max_samples,
-        "eval_split_requested": args.eval_split,
-        "eval_split_used": eval_split_used,
-        "hf_eval_holdout_fraction": float(args.hf_eval_holdout_fraction),
-        "eval_max_samples": args.eval_max_samples,
-        "eval_balanced_subset": eval_balanced_meta,
-        "eval_balanced_per_side": args.eval_balanced_per_side,
-        "eval_no_balanced_subset": bool(args.eval_no_balanced_subset),
+        "train_csv": str(train_csv_path),
+        "train_rows": len(csv_rows),
+        "eval_csv": str(eval_csv_path) if eval_csv_path else None,
+        "eval_rows": len(csv_eval_rows) if csv_eval_rows else 0,
         "eval_schedule": eval_schedule,
         "eval_steps": eval_steps_effective if final_has_eval and use_step_checkpointing else None,
         "eval_early_stopping_patience": esp,
-        "csv_supervised_test_csv_eval_only": csv_supervised_test_csv_eval_only,
         "per_device_eval_batch_size": int(args.per_device_eval_batch_size) if final_has_eval else None,
         "skip_eval": bool(args.skip_eval),
-        "eval_dataset_len": len(eval_ds) if eval_ds is not None else 0,
         "eval_enabled_for_training": final_has_eval,
-        "vgspv_train_csv": str(train_csv_path) if train_csv_path else None,
-        "vgspv_csv": args.vgspv_csv,
-        "vgspv_eval_csv": str(eval_csv_path) if eval_csv_path else None,
-        "vgspv_mix_fraction": mix_fraction if csv_rows else 0.0,
-        "vgspv_csv_supervised_only": bool(args.vgspv_csv_supervised_only),
-        "vgspv_prompt_instruction": vgspv_prompt if csv_rows else None,
+        "vgspv_prompt_instruction": vgspv_prompt,
         "vgspv_image_root": str(img_root) if img_root else None,
-        "bbox_hf_image_root": args.bbox_hf_image_root,
-        "mix_seed": args.mix_seed,
-        "no_vgspv_csv": bool(args.no_vgspv_csv),
+        "max_train_rows": args.max_train_rows,
+        "max_eval_rows": args.max_eval_rows,
         "resume_adapter_path": args.resume_adapter_path,
         "save_every_steps": int(args.save_every_steps),
         "save_strategy": save_strategy,
         "use_step_checkpointing": use_step_checkpointing,
         "save_every_n_epochs": args.save_every_n_epochs,
+        "save_total_limit": save_total_limit_arg,
         "save_optimizer_state": bool(args.save_optimizer_state),
         "save_only_model": not bool(args.save_optimizer_state),
         "lora": {"r": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout},
