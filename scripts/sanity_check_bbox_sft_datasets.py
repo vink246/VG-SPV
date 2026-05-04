@@ -10,6 +10,7 @@ Examples (from repo root):
   python scripts/sanity_check_bbox_sft_datasets.py
   python scripts/sanity_check_bbox_sft_datasets.py --hf-local-files-only --max-samples 3
   python scripts/sanity_check_bbox_sft_datasets.py --dataset-id lmms-lab/RefCOCO --split val --max-samples 2
+  python scripts/sanity_check_bbox_sft_datasets.py --image-root /path/to/coco  # override data/coco
 """
 
 from __future__ import annotations
@@ -38,6 +39,12 @@ def main() -> int:
         action="store_true",
         help="Same as training: only use local HF cache (no network).",
     )
+    p.add_argument(
+        "--image-root",
+        type=str,
+        default=None,
+        help="COCO root (train2014/, train2017/, …). Default: repo data/coco if present. Same as BBOX_SFT_IMAGE_ROOT.",
+    )
     args = p.parse_args()
 
     from train.bounding_box_sft_dataset import hf_row_to_bbox_sft_sample, load_bbox_sft_hf_datasets
@@ -50,6 +57,7 @@ def main() -> int:
         max_samples=max_s,
         config_name=None,
         local_files_only=bool(args.hf_local_files_only),
+        image_root=args.image_root,
     )
     n = len(ds)
     if n == 0:

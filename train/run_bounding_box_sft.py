@@ -10,9 +10,11 @@ Saved layout (compatible with `inference/run_inference.py --lora-adapter` and `t
 
 Requires: torch, transformers, peft, datasets, accelerate, pillow.
 
-By default, uses HF ``train`` / ``val`` (or holdout from train) for REC loss plus
-``data/.../train_method2.csv`` mixed into training and ``test_method2.csv`` for eval loss
-(``eval_loss`` in logs). Disable with ``--skip_eval`` / ``--no_vgspv_csv``.
+Default HF REC source is **PaDT-MLLM/RefCOCO** (``--dataset_id``). When
+``data/mm-safebench_1/extracted_data/traces/train_method2.csv`` exists, it is **mixed into training**
+with PaDT at ``--vgspv_mix_fraction`` (default **0.25**). Default eval adds ``test_method2.csv`` for
+``eval_loss``. Use ``--vgspv_csv`` / ``--vgspv_eval_csv`` to point at other VG-fDPO-style CSVs; use
+``--no_vgspv_csv`` or ``--skip_eval`` to turn those off.
 """
 
 from __future__ import annotations
@@ -146,13 +148,15 @@ def parse_args() -> argparse.Namespace:
         "--vgspv_csv",
         type=str,
         default=None,
-        help="Train VG-SPV CSV (image, chosen_reasoning_trace, …). Default: repo train_method2.csv if present.",
+        help="Train VG-fDPO / Method-2 CSV (image, chosen_reasoning_trace with <risk_factors_with_boxes>, …). "
+        "Default: data/mm-safebench_1/extracted_data/traces/train_method2.csv if that file exists.",
     )
     p.add_argument(
         "--vgspv_mix_fraction",
         type=float,
         default=0.25,
-        help="Fraction of train steps from VG-SPV CSV vs HF (0–1). Ignored when no train CSV is loaded.",
+        help="Fraction of train steps from VG-fDPO CSV vs PaDT HF (0–1). E.g. 0.25 ≈ 25%% CSV, 75%% PaDT. "
+        "Ignored when no train CSV is loaded.",
     )
     p.add_argument(
         "--vgspv_prompt_instruction",
@@ -165,6 +169,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional base dir for resolving relative `image` paths in --vgspv_csv (default: repo root + cwd).",
+    )
+    p.add_argument(
+        "--bbox_hf_image_root",
+        type=str,
+        default=None,
+        help="COCO root for HF basenames (PaDT): directory containing train2014/ (typical), train2017/, etc. "
+        "Default when unset: repo data/coco/ if it exists. Same as env BBOX_SFT_IMAGE_ROOT.",
     )
     p.add_argument(
         "--mix_seed",
@@ -262,6 +273,7 @@ def _try_load_hf_eval(
     config_name: str | None,
     local_files_only: bool,
     max_eval_samples: int | None,
+    image_root: str | None,
 ):
     """Return (dataset, split_name_used) or (None, None)."""
     order: list[str] = []
@@ -278,6 +290,7 @@ def _try_load_hf_eval(
                 max_samples=max_eval_samples,
                 config_name=config_name,
                 local_files_only=local_files_only,
+                image_root=image_root,
             )
             if len(ds) > 0:
                 return ds, sp
@@ -310,6 +323,7 @@ def main() -> None:
         max_samples=args.max_samples,
         config_name=args.dataset_config,
         local_files_only=bool(args.hf_local_files_only),
+        image_root=args.bbox_hf_image_root,
     )
 
     hf_eval_ds = None
@@ -322,6 +336,7 @@ def main() -> None:
             config_name=args.dataset_config,
             local_files_only=bool(args.hf_local_files_only),
             max_eval_samples=args.eval_max_samples,
+            image_root=args.bbox_hf_image_root,
         )
         if hf_eval_ds is None or len(hf_eval_ds) == 0:
             hold = float(args.hf_eval_holdout_fraction)
@@ -518,6 +533,7 @@ def main() -> None:
         "vgspv_mix_fraction": mix_fraction if csv_rows else 0.0,
         "vgspv_prompt_instruction": vgspv_prompt if csv_rows else None,
         "vgspv_image_root": str(img_root) if img_root else None,
+        "bbox_hf_image_root": args.bbox_hf_image_root,
         "mix_seed": args.mix_seed,
         "no_vgspv_csv": bool(args.no_vgspv_csv),
         "resume_adapter_path": args.resume_adapter_path,

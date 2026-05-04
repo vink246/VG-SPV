@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_config", type=str, default=None)
     p.add_argument("--split", type=str, default="val")
     p.add_argument("--max_samples", type=int, default=500)
+    p.add_argument(
+        "--bbox_hf_image_root",
+        type=str,
+        default=None,
+        help="COCO root (train2014/, train2017/, …) for PaDT basenames. Default: data/coco if present. Same as BBOX_SFT_IMAGE_ROOT.",
+    )
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--output_json", type=str, default=None)
@@ -83,6 +89,7 @@ def main() -> None:
         args.split,
         max_samples=args.max_samples,
         config_name=args.dataset_config,
+        image_root=args.bbox_hf_image_root,
     )
 
     ious: list[float] = []

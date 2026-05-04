@@ -218,8 +218,52 @@ Training data is stored as **CSV** files with the following columns (headers may
 - **Training HF rows:** Loaded from **`--split`** (default **`train`**) for **`--dataset_id`** plus any **`--extra_dataset`** entries; multiple sources are **concatenated** when their schemas are compatible (`train/bounding_box_sft_dataset.py::load_bbox_sft_hf_datasets`). Cap training rows with **`--max_samples`** for debugging. Referring text is read from common columns (**`utterance`**, **`sent`**, …) or, for PaDT, parsed from **`conversations` / `messages`** using the *“sentence describes: …”* pattern; boxes may live under **`objects.value[].bbox`** when **`bbox`** is absent (`train/bounding_box_sft_dataset.py`).
 - **Eval HF rows (for `eval_loss`):** The script tries, in order, **`--eval_split`** (default **`val`**), then **`validation`**, then **`test`**. If none of those splits load or they are empty, it **holds out** **`--hf_eval_holdout_fraction`** (default **0.02**) of the **loaded train HF** split into a disjoint eval shard (train HF is then the remainder). Cap eval HF rows after loading with **`--eval_max_samples`**.
 - **Hub vs local disk:** A **`--dataset_id`** or **`--extra_dataset`** value that is an existing directory is loaded with **`datasets.load_from_disk`** (must be a dataset saved with `Dataset.save_to_disk` / `DatasetDict.save_to_disk`). Hub ids use **`datasets.load_dataset`**. For **offline / PACE** cache mirrors, point **`HF_HOME`** (or related HF env vars) at scratch and pass **`--hf_local_files_only`** (implemented via **`DownloadConfig(local_files_only=True)`** in code — PaDT JSON hubs do not accept a top-level `local_files_only` argument to `load_dataset`).
-- **More REC data:** On Hugging Face, **`PaDT-MLLM/RefCOCO`** is typically **one** dataset card whose default builder already lists **refcoco**, **refcoco+**, and **refcocog** train/val/test JSON files together. There is usually **no** separate hub id like `PaDT-MLLM/RefCOCOPlus` — passing it as `--extra_dataset` triggers `DatasetNotFoundError`. Use **`--dataset_id PaDT-MLLM/RefCOCO` only** (no PaDT extras) unless you have verified additional hub ids. **lmms-lab** hosts separate **`RefCOCO` / `RefCOCOplus` / `RefCOCOg`** hubs (mostly **`val`** for eval). The downloader [`scripts/download_bounding_box_sft_datasets.py`](scripts/download_bounding_box_sft_datasets.py) presets **`train_rec`** / **`eval_rec`** warm the cache.
+- **More REC data:** On Hugging Face, **`PaDT-MLLM/RefCOCO`** is typically **one** dataset card whose default builder already lists **refcoco**, **refcoco+**, and **refcocog** train/val/test JSON files together. There is usually **no** separate hub id like `PaDT-MLLM/RefCOCOPlus` — passing it as `--extra_dataset` triggers `DatasetNotFoundError`. Use **`--dataset_id PaDT-MLLM/RefCOCO` only** unless you add another hub you have verified. The downloader [`scripts/download_bounding_box_sft_datasets.py`](scripts/download_bounding_box_sft_datasets.py) can warm **`train_rec`** (PaDT train) or **`eval_rec`** (separate **lmms-lab** eval hubs) if you use them.
 - **PaDT builder config:** On current Hugging Face `datasets`, these PaDT hubs typically expose a single builder config named **`default`**. Do **not** pass `--dataset_config refcoco` (that name is not registered); omit **`--dataset_config`** or set **`--dataset_config default`** if you need to be explicit. If unsure, run `from datasets import get_dataset_config_names; print(get_dataset_config_names("PaDT-MLLM/RefCOCO"))` in Python.
+- **COCO JPEGs (PaDT):** See **Minimal setup (PaDT only)** below. Override the root with **`BBOX_SFT_IMAGE_ROOT`** or **`--bbox_hf_image_root`**.
+
+### Minimal setup (PaDT only, bounding-box SFT)
+
+PaDT’s Hub rows store a **JPEG file name** (often `COCO_train2014_*.jpg`). That name matches the **MSCOCO 2014 train** image pack, **not** the default filenames in the COCO **2017** train zip (`COCO_train2017_*.jpg` are different files). So **PaDT + “only COCO 2017 unpacked” does not work** unless you also have the matching 2014-named JPEGs (e.g. under `data/coco/train2014/` from the official 2014 train zip).
+
+Do this once:
+
+1. **HF annotations (network or login node)** — warms the Hugging Face datasets cache (metadata only, not the JPEGs):
+
+   ```bash
+   python scripts/download_bounding_box_sft_datasets.py --dataset_id PaDT-MLLM/RefCOCO --split train
+   ```
+
+2. **MSCOCO pixels** — from [cocodataset.org](https://cocodataset.org/#download), download **2014 Train images** (`train2014.zip`), unzip so you have:
+
+   `data/coco/train2014/COCO_train2014_000000xxxxxx.jpg` (same layout as the official zip; repo root = VG-SPV root).
+
+   Add **2014 Val** (`val2014.zip`) if you need val-style `COCO_val2014_*.jpg` rows. The loader also tries `train2017/` / `val2017/` as a second choice for the same basename if you mirror files there.
+
+3. **Check** (from repo root, after step 1–2):
+
+   ```bash
+   python scripts/sanity_check_bbox_sft_datasets.py
+   ```
+
+4. **Train (PaDT + VG-fDPO CSV mix)** — defaults: **`--dataset_id PaDT-MLLM/RefCOCO`**, **`--split train`**, and **`data/coco`** when present. If **`data/mm-safebench_1/extracted_data/traces/train_method2.csv`** exists, it is **mixed automatically** with PaDT at **`--vgspv_mix_fraction`** (default **0.25** = 25% of training steps from the CSV, 75% from PaDT; deterministic via **`--mix_seed`**).
+
+   ```bash
+   python train/run_bounding_box_sft.py --model_name <your_vlm> --bf16 --gradient_checkpointing
+   ```
+
+   Explicit paths and mix (same behavior as defaults when those files exist):
+
+   ```bash
+   python train/run_bounding_box_sft.py --model_name <your_vlm> --bf16 --gradient_checkpointing \
+     --dataset_id PaDT-MLLM/RefCOCO --split train \
+     --vgspv_csv data/mm-safebench_1/extracted_data/traces/train_method2.csv \
+     --vgspv_mix_fraction 0.25
+   ```
+
+   Use **`--no_vgspv_csv`** for PaDT-only training. Tune **`--vgspv_mix_fraction`** toward `1.0` for more CSV-heavy training.
+
+**Offline compute nodes:** set `HF_HOME` (or `HF_DATASETS_CACHE`) to the machine where you ran step 1, then add **`--hf_local_files_only`**. You do **not** need other Hub REC datasets if PaDT `train` plus a small **train holdout** for eval is enough (the trainer falls back to `--hf_eval_holdout_fraction` when hub `val`/`test` is missing or empty).
 
 ### MM-SafetyBench Method 2 CSVs (VG-SPV traces)
 
@@ -279,7 +323,7 @@ Full flag reference (`python train/run_bounding_box_sft.py --help` is authoritat
 | Area | Flags |
 |------|--------|
 | Model | **`--model_name`** (required), **`--model_family`** (`qwen3_vl`, `llava`, `mllama`, `tinyllava` — bbox SFT collator rejects TinyLLaVA today), **`--bf16`**, **`--gradient_checkpointing`** |
-| HF REC data | **`--dataset_id`**, **`--extra_dataset`** (repeatable hub id or `save_to_disk` path), **`--dataset_config`**, **`--split`** (train HF), **`--max_samples`**, **`--hf_local_files_only`** |
+| HF REC data | **`--dataset_id`**, **`--extra_dataset`** (repeatable hub id or `save_to_disk` path), **`--dataset_config`**, **`--split`** (train HF), **`--max_samples`**, **`--hf_local_files_only`**, **`--bbox_hf_image_root`** (COCO root; default `data/coco` when present) |
 | Eval (HF + `eval_loss`) | **`--eval_split`**, **`--hf_eval_holdout_fraction`** (if no hub val), **`--eval_max_samples`**, **`--eval_steps`**, **`--per_device_eval_batch_size`**, **`--skip_eval`** |
 | VG-SPV CSV | **`--vgspv_csv`**, **`--vgspv_eval_csv`**, **`--vgspv_mix_fraction`**, **`--no_vgspv_csv`**, **`--vgspv_prompt_instruction`**, **`--vgspv_image_root`**, **`--mix_seed`** |
 | Resume | **`--resume_adapter_path`** — PEFT dir (`adapter/` or `adapter_latest/`); skips fresh LoRA init |

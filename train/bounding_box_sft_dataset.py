@@ -3,7 +3,10 @@ HF datasets → bounding-box SFT rows (image, referring expression, one or more 
 
 Supported hubs (see ``scripts/download_bounding_box_sft_datasets.py``):
   - lmms-lab/RefCOCO (val/test splits; eval-oriented)
-  - PaDT-MLLM/RefCOCO (single hub; default config bundles refcoco / refcoco+ / refcocog JSON splits)
+  - PaDT-MLLM/RefCOCO (single hub; default config bundles refcoco / refcoco+ / refcocog JSON splits).
+    Rows store a COCO JPEG basename (often ``COCO_train2014_*.jpg``). Resolve under ``data/coco/`` using
+    MSCOCO split folders (``train2014/`` then ``train2017/`` for train basenames, etc.). Override with
+    ``BBOX_SFT_IMAGE_ROOT`` or ``--bbox_hf_image_root`` / ``load_bbox_sft_hf_datasets(..., image_root=...)``.
 
 Local directories created with ``Dataset.save_to_disk`` / ``DatasetDict.save_to_disk`` can be passed
 instead of a hub id (PACE scratch mirrors of HF caches).
@@ -12,6 +15,7 @@ instead of a hub id (PACE scratch mirrors of HF caches).
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -30,6 +34,98 @@ from train.dataset_adapter import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Default layout: repo ``data/coco/{train2014,train2017,...}/<basename>`` (see ``_coco_candidate_subdirs``).
+DEFAULT_BBOX_COCO_ROOT = _REPO_ROOT / "data" / "coco"
+
+# Set on each ``load_bbox_sft_hf_datasets`` / ``load_bbox_sft_hf_dataset`` call (CLI ``--bbox_hf_image_root``).
+_ACTIVE_BBOX_COCO_ROOT: Path | None = None
+
+
+def reset_bbox_hf_coco_root_for_tests() -> None:
+    """Reset COCO root override (unit tests only)."""
+    global _ACTIVE_BBOX_COCO_ROOT
+    _ACTIVE_BBOX_COCO_ROOT = None
+
+
+def set_bbox_hf_coco_root_for_tests(root: Path | str | None) -> None:
+    """Force COCO root for tests that call ``hf_row_to_bbox_sft_sample`` without loading a HF dataset."""
+    global _ACTIVE_BBOX_COCO_ROOT
+    if root is None:
+        _ACTIVE_BBOX_COCO_ROOT = None
+        return
+    p = Path(root).expanduser().resolve()
+    _ACTIVE_BBOX_COCO_ROOT = p if p.is_dir() else None
+
+
+def _refresh_active_bbox_coco_root(image_root: str | Path | None) -> None:
+    """Pick COCO root: explicit arg > BBOX_SFT_IMAGE_ROOT > data/coco if present."""
+    global _ACTIVE_BBOX_COCO_ROOT
+    if image_root is not None:
+        p = Path(image_root).expanduser().resolve()
+        _ACTIVE_BBOX_COCO_ROOT = p if p.is_dir() else None
+        return
+    env = (os.environ.get("BBOX_SFT_IMAGE_ROOT") or "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        _ACTIVE_BBOX_COCO_ROOT = p if p.is_dir() else None
+        return
+    _ACTIVE_BBOX_COCO_ROOT = DEFAULT_BBOX_COCO_ROOT.resolve() if DEFAULT_BBOX_COCO_ROOT.is_dir() else None
+
+
+def _coco_roots_for_resolve() -> list[Path]:
+    if _ACTIVE_BBOX_COCO_ROOT is not None and _ACTIVE_BBOX_COCO_ROOT.is_dir():
+        return [_ACTIVE_BBOX_COCO_ROOT]
+    env = (os.environ.get("BBOX_SFT_IMAGE_ROOT") or "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        if p.is_dir():
+            return [p]
+    if DEFAULT_BBOX_COCO_ROOT.is_dir():
+        return [DEFAULT_BBOX_COCO_ROOT.resolve()]
+    return []
+
+
+def _coco_candidate_subdirs(basename: str) -> list[str]:
+    """
+    MSCOCO subfolders to try under the COCO root, in order.
+
+    PaDT train rows typically use **2014-style basenames** (``COCO_train2014_*.jpg``), which match the
+    official **COCO 2014 train** image release (``train2014/``), not ``COCO_train2017_*.jpg`` from the
+    2017 zip. We try ``train2014`` first, then ``train2017`` so a standard 2014 unzip "just works".
+    """
+    lower = basename.lower()
+    if lower.startswith("coco_train2014_"):
+        return ["train2014", "train2017"]
+    if lower.startswith("coco_train2017_"):
+        return ["train2017"]
+    if lower.startswith("coco_val2014_"):
+        return ["val2014", "val2017"]
+    if lower.startswith("coco_val2017_"):
+        return ["val2017"]
+    if lower.startswith("coco_test2017_"):
+        return ["test2017"]
+    if lower.startswith("coco_test2014_"):
+        return ["test2014", "test2017"]
+    return []
+
+
+def _resolve_image_path_string(s: str) -> Path | None:
+    """Map a row ``image`` string to an existing file, including COCO basenames under the active root."""
+    path = Path(s).expanduser()
+    if path.is_file():
+        return path.resolve()
+    name = path.name
+    subdirs = _coco_candidate_subdirs(name)
+    for root in _coco_roots_for_resolve():
+        for sub in subdirs:
+            cand = root / sub / name
+            if cand.is_file():
+                return cand.resolve()
+        cand = root / name
+        if cand.is_file():
+            return cand.resolve()
+    return None
 
 
 @dataclass
@@ -309,13 +405,19 @@ def _get_image(row: dict[str, Any]) -> Any:
                     return Image.open(BytesIO(r.read())).convert("RGB")
             except URLError as e:
                 raise ValueError(f"Could not download image URL: {s!r}") from e
-        path = Path(s).expanduser()
-        if path.is_file():
-            return Image.open(path).convert("RGB")
+        resolved = _resolve_image_path_string(s)
+        if resolved is not None:
+            return Image.open(resolved).convert("RGB")
         try:
             return Image.open(s).convert("RGB")
         except OSError as e:
-            raise ValueError(f"Could not open image path: {s!r}") from e
+            hint = ""
+            if _coco_candidate_subdirs(Path(s.strip()).name):
+                hint = (
+                    f" Expected JPEG under {DEFAULT_BBOX_COCO_ROOT}/train2014/ or .../train2017/ (see README). "
+                    "Or set BBOX_SFT_IMAGE_ROOT / --bbox_hf_image_root / image_root=."
+                )
+            raise ValueError(f"Could not open image path: {s!r}.{hint}") from e
     return img
 
 
@@ -399,16 +501,21 @@ def load_bbox_sft_hf_datasets(
     trust_remote_code: bool = False,
     config_name: str | None = None,
     local_files_only: bool = False,
+    image_root: str | Path | None = None,
 ):
     """
     Load one or more REC-style datasets and concatenate (same split key for each hub source).
 
     All parts must be row-compatible with ``hf_row_to_bbox_sft_sample`` (image + expression + bbox).
+
+    ``image_root``: optional COCO root (directory containing ``train2014/``, ``train2017/``, …). Overrides
+    ``BBOX_SFT_IMAGE_ROOT`` and the default ``data/coco`` for this process until the next load.
     """
     from datasets import concatenate_datasets
 
     if not dataset_sources:
         raise ValueError("dataset_sources must be non-empty")
+    _refresh_active_bbox_coco_root(image_root)
     parts: list[Any] = []
     for src in dataset_sources:
         try:
@@ -458,6 +565,7 @@ def load_bbox_sft_hf_dataset(
     trust_remote_code: bool = False,
     config_name: str | None = None,
     local_files_only: bool = False,
+    image_root: str | Path | None = None,
 ):
     return load_bbox_sft_hf_datasets(
         [dataset_id],
@@ -466,6 +574,7 @@ def load_bbox_sft_hf_dataset(
         trust_remote_code=trust_remote_code,
         config_name=config_name,
         local_files_only=local_files_only,
+        image_root=image_root,
     )
 
 
