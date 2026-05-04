@@ -11,6 +11,8 @@ instead of a hub id (PACE scratch mirrors of HF caches).
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,6 +78,7 @@ def infer_norm_boxes_from_row(row: dict[str, Any], image: Any) -> list[tuple[flo
     - If ``bbox`` is a list of four-number boxes (some hubs), returns each normalized box.
     - If ``bboxes`` / ``boxes`` / ``gt_boxes`` / ``bbox_list`` holds a list of boxes, uses that.
     - Otherwise a single flat ``bbox`` (length 4) yields a one-element list.
+    - PaDT-style ``objects`` dict with ``value`` list of ``{bbox, label}`` is also supported.
     """
     w, h = _pil_size(image)
     for key in ("bboxes", "boxes", "gt_boxes", "bbox_list"):
@@ -98,26 +101,60 @@ def infer_norm_boxes_from_row(row: dict[str, Any], image: Any) -> list[tuple[flo
             if out:
                 return out
     raw = row.get("bbox")
-    if raw is None:
+    if raw is not None:
+        if hasattr(raw, "tolist"):
+            raw = raw.tolist()
+        if isinstance(raw, (list, tuple)):
+            if len(raw) >= 1:
+                el0 = raw[0]
+                if isinstance(el0, (list, tuple)) and len(el0) >= 4:
+                    out = []
+                    for item in raw:
+                        if not isinstance(item, (list, tuple)) or len(item) < 4:
+                            continue
+                        t = _norm_xyxy_one(list(item[:4]), w, h)
+                        if t is not None:
+                            out.append(t)
+                    if out:
+                        return out
+            if len(raw) >= 4:
+                t = _norm_xyxy_one([float(x) for x in raw[:4]], w, h)
+                if t is not None:
+                    return [t]
+    boxes_obj = _infer_norm_boxes_from_objects(row, w, h)
+    if boxes_obj:
+        return boxes_obj
+    return []
+
+
+def _infer_norm_boxes_from_objects(
+    row: dict[str, Any], w: int, h: int
+) -> list[tuple[float, float, float, float]]:
+    """PaDT-style ``objects.value[]`` entries with ``bbox`` (often normalized xyxy)."""
+    o = row.get("objects")
+    if o is None:
         return []
-    if hasattr(raw, "tolist"):
-        raw = raw.tolist()
-    if not isinstance(raw, (list, tuple)):
-        return []
-    if len(raw) >= 1:
-        el0 = raw[0]
-        if isinstance(el0, (list, tuple)) and len(el0) >= 4:
-            out = []
-            for item in raw:
-                if not isinstance(item, (list, tuple)) or len(item) < 4:
+    if hasattr(o, "tolist"):
+        o = o.tolist()
+    if isinstance(o, dict):
+        items = o.get("value") or o.get("objects") or o.get("instances")
+        if isinstance(items, list):
+            out: list[tuple[float, float, float, float]] = []
+            for item in items:
+                if not isinstance(item, dict):
                     continue
-                t = _norm_xyxy_one(list(item[:4]), w, h)
+                bb = item.get("bbox")
+                if not isinstance(bb, (list, tuple)) or len(bb) < 4:
+                    continue
+                t = _norm_xyxy_one([float(x) for x in bb[:4]], w, h)
                 if t is not None:
                     out.append(t)
-            return out
-    if len(raw) >= 4:
-        t = _norm_xyxy_one([float(x) for x in raw[:4]], w, h)
-        return [t] if t is not None else []
+            if out:
+                return out
+        bb = o.get("bbox")
+        if isinstance(bb, (list, tuple)) and len(bb) >= 4:
+            t = _norm_xyxy_one([float(x) for x in bb[:4]], w, h)
+            return [t] if t is not None else []
     return []
 
 
@@ -127,11 +164,115 @@ def infer_norm_box_from_row(row: dict[str, Any], image: Any) -> tuple[float, flo
     return boxes[0] if boxes else None
 
 
+_RE_DESC_QUOTED = re.compile(
+    r"""this\s+sentence\s+describes\s*:\s*["']([^"']+)["']""",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _scalar_to_str(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="replace").strip()
+    if hasattr(v, "item") and callable(getattr(v, "item")):
+        try:
+            return str(v.item()).strip()
+        except Exception:
+            pass
+    return str(v).strip()
+
+
+def _normalize_conversation_list(raw: Any) -> list[dict[str, Any]] | None:
+    if raw is None:
+        return None
+    if hasattr(raw, "tolist"):
+        raw = raw.tolist()
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("[") or s.startswith("{"):
+            try:
+                raw = json.loads(s)
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+    if not isinstance(raw, (list, tuple)):
+        return None
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            out.append(item)
+    return out or None
+
+
+def _phrase_from_conversation_text(text: str) -> str:
+    if not text:
+        return ""
+    m = _RE_DESC_QUOTED.search(text)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _phrase_from_conversation_lists(row: dict[str, Any]) -> str:
+    for key in ("conversations", "messages", "dialog", "instruction", "instruction_input"):
+        conv = _normalize_conversation_list(row.get(key))
+        if not conv:
+            continue
+        for turn in conv:
+            if not isinstance(turn, dict):
+                continue
+            role = (turn.get("from") or turn.get("role") or "").strip().lower()
+            if role in ("gpt", "assistant", "model"):
+                continue
+            val = turn.get("value") or turn.get("content") or turn.get("text")
+            if isinstance(val, list):
+                parts = []
+                for block in val:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(_scalar_to_str(block.get("text")))
+                blob = "\n".join(p for p in parts if p)
+            else:
+                blob = _scalar_to_str(val)
+            hit = _phrase_from_conversation_text(blob)
+            if hit:
+                return hit
+    return ""
+
+
 def _get_question(row: dict[str, Any]) -> str:
-    for key in ("question", "sentence", "expression", "text", "referring_expression", "prompt"):
+    keys = (
+        "question",
+        "sentence",
+        "expression",
+        "text",
+        "referring_expression",
+        "prompt",
+        "utterance",
+        "utter",
+        "sent",
+        "refExp",
+        "ref_exp",
+        "query",
+        "noun_phrase",
+        "description",
+        "caption",
+        "instruction",
+        "refer_query",
+    )
+    for key in keys:
         v = row.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+        if v is None:
+            continue
+        s = _scalar_to_str(v)
+        if s:
+            return s
+    conv_phrase = _phrase_from_conversation_lists(row)
+    if conv_phrase:
+        return conv_phrase
     return ""
 
 
