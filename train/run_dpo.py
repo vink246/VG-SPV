@@ -39,6 +39,25 @@ def _trl_processing_class(loaded: LoadedVLM) -> Any:
     return loaded.processor if loaded.processor is not None else loaded.tokenizer
 
 
+def _maybe_resize_token_embeddings(model: Any, processing_class: Any) -> None:
+    """
+    Align LM embedding rows with tokenizer vocabulary length.
+
+    Hugging Face logs often note tokenizer/config token-id alignment; if ``len(tokenizer)`` exceeds
+    ``embed_tokens.weight`` rows, CUDA embedding gathers hit device-side asserts with no Python frame.
+    """
+    if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
+        return
+    tok = getattr(processing_class, "tokenizer", processing_class)
+    n = len(tok)
+    emb = model.get_input_embeddings()
+    if emb is None:
+        return
+    cur = emb.weight.shape[0]
+    if cur < n and hasattr(model, "resize_token_embeddings"):
+        model.resize_token_embeddings(n)
+
+
 def _str2bool(s: str) -> bool:
     v = s.strip().lower()
     if v in ("1", "true", "t", "yes", "y"):
@@ -58,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     add("model_name", str, "HF model id or local path")
     add("data_path", str, "Train split: DPO dataset CSV / dir / HF id")
     add("eval_data_path", str, "Eval/test split CSV / dir / HF id (optional; eval each epoch when set)")
+    add("eval_steps", int, "Evaluate every N steps (overrides epoch-level eval)")
     add("output_dir", str, "Training output directory")
     add("prompt_instruction", str, "Prompt text when loading from CSV")
     add("num_train_epochs", int, "")
@@ -140,13 +160,13 @@ def _prepare_policy_and_ref(cfg: DPOTrainConfig, dtype: torch.dtype) -> tuple[An
             ref_model = ref_loaded.model
             for p in ref_model.parameters():
                 p.requires_grad = False
-            return inner, ref_model, proc
+            return inner, None, proc
 
         for p in inner.parameters():
             p.requires_grad = False
         lcfg = default_lora_config(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
         policy = attach_lora(inner, lora_config=lcfg, freeze_vision=True, prepare_kbit=cfg.ref_8bit)
-        return policy, inner, proc
+        return policy, None, proc
 
     if cfg.ref_8bit:
         policy_loaded = load_vlm(cfg.model_name, dtype=dtype)
@@ -168,14 +188,21 @@ def _prepare_policy_and_ref(cfg: DPOTrainConfig, dtype: torch.dtype) -> tuple[An
         )
         return policy, ref_model, proc
 
-    loaded = load_vlm(cfg.model_name, dtype=dtype)
-    ref_model = loaded.model
-    for p in ref_model.parameters():
-        p.requires_grad = False
+    # Load the base model natively in 8-bit using bitsandbytes
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=dtype,
+        bnb_4bit_use_double_quant=True,
+    )
+    loaded = load_vlm(cfg.model_name, dtype=dtype, quantization_config=quant_config)
+    
     proc = _trl_processing_class(loaded)
     lcfg = default_lora_config(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
-    policy = attach_lora(loaded.model, lora_config=lcfg, freeze_vision=True, prepare_kbit=False)
-    return policy, ref_model, proc
+    
+    # Crucial: prepare_kbit=True sets up the 8-bit weights for gradients BEFORE attaching LoRA
+    policy = attach_lora(loaded.model, lora_config=lcfg, freeze_vision=True, prepare_kbit=True)
+    return policy, None, proc
 
 
 def main() -> None:
@@ -195,6 +222,9 @@ def main() -> None:
 
     dtype = torch.bfloat16 if cfg.bf16 else torch.float32
     model, ref_model, processing_class = _prepare_policy_and_ref(cfg, dtype)
+    _maybe_resize_token_embeddings(model, processing_class)
+    if ref_model is not None:
+        _maybe_resize_token_embeddings(ref_model, processing_class)
 
     pi = cfg.prompt_instruction or DEFAULT_PROMPT_INSTRUCTION
     train_dataset = load_dpo_dataset(cfg.data_path, prompt_instruction=pi)
@@ -216,7 +246,12 @@ def main() -> None:
         logging_steps=cfg.logging_steps,
         save_steps=cfg.save_steps,
         save_total_limit=cfg.save_total_limit,
-        eval_strategy="epoch" if eval_dataset is not None else "no",
+        eval_strategy="steps" if (eval_dataset is not None and cfg.eval_steps) else ("epoch" if eval_dataset is not None else "no"),
+        eval_steps=cfg.eval_steps if (eval_dataset is not None and cfg.eval_steps) else None,
+        dataloader_num_workers=8,
+        optim="paged_adamw_8bit",
+        gradient_checkpointing=True,
+        report_to="tensorboard",
     )
 
     trainer = VGSPVTrainer(
@@ -237,6 +272,11 @@ def main() -> None:
         s_fallback_value=cfg.s_fallback_value,
         strict_scaler_inputs=cfg.strict_scaler_inputs,
     )
+    # Force a baseline evaluation before any weights are updated!
+    if eval_dataset is not None:
+        print("=== Running Baseline Evaluation (Step 0) ===", flush=True)
+        trainer.evaluate()
+    print("=== Starting DPO Training ===", flush=True)
     trainer.train()
     trainer.save_model(cfg.output_dir)
 

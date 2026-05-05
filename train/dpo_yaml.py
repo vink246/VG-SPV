@@ -21,6 +21,7 @@ class DPOTrainConfig:
     data_path: str | None = None
     # Optional CSV / HF id for evaluation (e.g. test split). When set, Trainer runs eval each epoch.
     eval_data_path: str | None = None
+    eval_steps: int | None = None
     output_dir: str = "outputs/dpo"
     prompt_instruction: str | None = None
 

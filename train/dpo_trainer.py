@@ -3,27 +3,23 @@ VG-SPV DPO Trainer implementing:
   - VG-fDPO masked loss (M_G / M_L / M_total) + format-fail fallback when ``use_vgfdpo=True`` (default)
   - Standard full-sequence DPO when ``use_vgfdpo=False``
   - V-DPO contrastive term when ``use_vdpo=True`` (opt-in; off by default; paper Eq. 7).
-    Enabling V-DPO requires the dataset to carry ``chosen_perturbed_*`` columns and
-    triggers an extra forward pass per step through the perturbed image.
 """
 
 from __future__ import annotations
 
 import math
 import re
+import contextlib
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import ProcessorMixin
 
-# TRL is lazy-loaded; use real DPOTrainer only. A stub base breaks ``super().__init__``
-# (object.__init__ rejects kwargs) and surfaces as confusing runtime errors on clusters.
 try:
     from trl import DPOTrainer
-except ImportError:  # pragma: no cover - alternate layouts across trl versions
+except ImportError: 
     try:
         from trl.trainer import DPOTrainer
     except ImportError:
@@ -32,20 +28,45 @@ except ImportError:  # pragma: no cover - alternate layouts across trl versions
 from train.tag_parsing import iou_xyxy_norm, parse_first_norm_box
 
 _RISK_TAGS = ("risk_factors", "risk_factors_with_boxes")
-_LOGIC_TAG = "logic"
-_RESPONSE_TAG = "response"
+_TRL_PREFERENCE_NON_MODEL_KEYS = frozenset({"completion_mask", "ref_chosen_logps", "ref_rejected_logps"})
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
-def _find_subsequence(haystack: list[int], needle: list[int], start: int = 0) -> int:
-    if not needle or not haystack or start >= len(haystack):
-        return -1
-    n = len(needle)
-    lim = len(haystack) - n + 1
-    for i in range(start, lim):
-        if haystack[i : i + n] == needle:
-            return i
-    return -1
+def _mllama_cross_attn_pad_suffix(cam: torch.Tensor, pad_len: int) -> torch.Tensor:
+    if pad_len <= 0:
+        return cam
+    b, ell = cam.shape[0], cam.shape[1]
+    trail = tuple(range(2, cam.dim()))
+    if trail:
+        active = cam.sum(dim=trail) > 0
+    else:
+        active = cam > 0
+    rev = active.flip(dims=[1])
+    idx_from_end = rev.long().argmax(dim=1)
+    last_active = ell - 1 - idx_from_end
+    pick = torch.where(active.any(dim=1), last_active, torch.zeros(b, dtype=torch.long, device=cam.device))
+    batch_ar = torch.arange(b, device=cam.device)
+    template = cam[batch_ar, pick]
+    return template.unsqueeze(1).expand(b, pad_len, *cam.shape[2:]).clone()
+
+
+def _sync_seq_len_tensors_with_input_ids(kwargs: dict[str, Any], seq_len: int) -> None:
+    for key in ("cross_attention_mask", "mm_token_type_ids"):
+        t = kwargs.get(key)
+        if t is None or not isinstance(t, torch.Tensor) or t.dim() < 2:
+            continue
+        cur = t.shape[1]
+        if cur == seq_len:
+            continue
+        if cur > seq_len:
+            kwargs[key] = t[:, :seq_len, ...].contiguous()
+            continue
+        pad_len = seq_len - cur
+        if key == "cross_attention_mask":
+            suffix = _mllama_cross_attn_pad_suffix(t, pad_len)
+            kwargs[key] = torch.cat([t, suffix], dim=1).contiguous()
+        else:
+            kwargs[key] = F.pad(t, (0, pad_len))
 
 
 def _counter_cosine(a: Counter[str], b: Counter[str]) -> float:
@@ -105,30 +126,14 @@ class VGSPVTrainer(DPOTrainer):
         super().__init__(*args, **kwargs)
         if self.grounding_mode not in {"semantic", "spatial"}:
             raise ValueError(f"Unsupported grounding_mode: {self.grounding_mode}")
-        self._tag_ids = self._build_tag_ids()
 
-    def _trl_encoding_tokenizer(self) -> Any:
-        """TRL stores text tokenizer as ``_tokenizer``; HF Trainer uses ``processing_class``."""
-        inner = getattr(self, "_tokenizer", None)
-        if inner is not None:
-            return inner
-        legacy = getattr(self, "tokenizer", None)
-        if legacy is not None:
-            return legacy
-        pc = getattr(self, "processing_class", None)
-        if pc is None:
-            raise RuntimeError("VGSPVTrainer: no tokenizer (expected TRL _tokenizer or processing_class).")
-        if isinstance(pc, ProcessorMixin):
-            return pc.tokenizer
-        return pc
-
-    def _build_tag_ids(self) -> dict[str, list[int]]:
-        tok = self._trl_encoding_tokenizer()
-        out: dict[str, list[int]] = {}
-        for t in _RISK_TAGS + (_LOGIC_TAG, _RESPONSE_TAG):
-            out[f"<{t}>"] = tok.encode(f"<{t}>", add_special_tokens=False)
-            out[f"</{t}>"] = tok.encode(f"</{t}>", add_special_tokens=False)
-        return out
+    def _get_tok(self):
+        """Safely fetch the tokenizer depending on the TRL version / processing_class."""
+        tok = getattr(self, "tokenizer", None)
+        if tok is None:
+            pc = getattr(self, "processing_class", None)
+            tok = getattr(pc, "tokenizer", pc)
+        return tok
 
     def _extract_model_kwargs(self, inputs: dict[str, Any], prefix: str) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -147,26 +152,49 @@ class VGSPVTrainer(DPOTrainer):
         gathered = torch.gather(log_probs, dim=-1, index=shift_labels.clamp_min(0).unsqueeze(-1)).squeeze(-1)
         return torch.where(shift_labels == -100, torch.zeros_like(gathered), gathered)
 
-    def _extract_block_mask(self, tokens: list[int], open_ids: list[int], close_ids: list[int]) -> torch.Tensor:
+    def _extract_block_mask(self, tokens: list[int], open_tag: str, close_tag: str) -> torch.Tensor:
         mask = torch.zeros(len(tokens), dtype=torch.bool)
-        if not open_ids or not close_ids:
+        if not tokens:
             return mask
-        i = 0
-        while i < len(tokens):
-            s = _find_subsequence(tokens, open_ids, i)
-            if s < 0:
-                break
-            e = _find_subsequence(tokens, close_ids, s + len(open_ids))
-            if e < 0:
-                break
-            mask[s : e + len(close_ids)] = True
-            i = e + len(close_ids)
+        
+        tok = self._get_tok()
+        full_text = tok.decode(tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        
+        spans = []
+        search_start = 0
+        while True:
+            s = full_text.find(open_tag, search_start)
+            if s == -1: break
+            e = full_text.find(close_tag, s)
+            if e == -1: break
+            e += len(close_tag)
+            spans.append((s, e))
+            search_start = e
+            
+        if not spans:
+            return mask
+            
+        prefix_lens = [0] * (len(tokens) + 1)
+        for i in range(1, len(tokens) + 1):
+            prefix_lens[i] = len(tok.decode(tokens[:i], skip_special_tokens=False, clean_up_tokenization_spaces=False))
+            
+        for (s_char, e_char) in spans:
+            left_t = 0
+            right_t = len(tokens)
+            for i in range(1, len(tokens) + 1):
+                if prefix_lens[i] > s_char and left_t == 0:
+                    left_t = i - 1
+                if prefix_lens[i] >= e_char:
+                    right_t = i
+                    break
+            mask[left_t:right_t] = True
+            
         return mask
 
     def _extract_risk_mask(self, tokens: list[int]) -> torch.Tensor:
         best = torch.zeros(len(tokens), dtype=torch.bool)
         for tag in _RISK_TAGS:
-            m = self._extract_block_mask(tokens, self._tag_ids[f"<{tag}>"], self._tag_ids[f"</{tag}>"])
+            m = self._extract_block_mask(tokens, f"<{tag}>", f"</{tag}>")
             if int(m.sum().item()) > int(best.sum().item()):
                 best = m
         return best
@@ -175,18 +203,21 @@ class VGSPVTrainer(DPOTrainer):
         if len(tokens) == 0 or int(mask.sum().item()) == 0:
             return ""
         ids = [t for t, keep in zip(tokens, mask.tolist()) if keep]
-        return self._trl_encoding_tokenizer().decode(ids, skip_special_tokens=False)
+        return self._get_tok().decode(ids, skip_special_tokens=False)
 
     def _sample_spans(self, labels_row: torch.Tensor) -> _SampleSpans:
         valid = labels_row[1:] != -100
         tokens = labels_row[1:][valid].tolist()
         m_total = torch.ones(len(tokens), dtype=torch.bool, device=labels_row.device)
+        
         m_g = self._extract_risk_mask(tokens).to(labels_row.device)
-        m_logic = self._extract_block_mask(tokens, self._tag_ids["<logic>"], self._tag_ids["</logic>"]).to(labels_row.device)
-        m_resp = self._extract_block_mask(tokens, self._tag_ids["<response>"], self._tag_ids["</response>"]).to(labels_row.device)
+        m_logic = self._extract_block_mask(tokens, "<logic>", "</logic>").to(labels_row.device)
+        m_resp = self._extract_block_mask(tokens, "<response>", "</response>").to(labels_row.device)
         m_l = m_logic | m_resp
+        
         parsed_ok = bool(int(m_g.sum().item()) > 0 and int(m_logic.sum().item()) > 0 and int(m_resp.sum().item()) > 0)
         risk_text = self._decode_from_mask(tokens, m_g)
+        
         return _SampleSpans(valid=valid, m_total=m_total, m_g=m_g, m_l=m_l, parsed_ok=parsed_ok, risk_text=risk_text)
 
     def _sum_segment_logp(self, token_logp_row: torch.Tensor, spans: _SampleSpans, mask_name: str) -> torch.Tensor:
@@ -217,6 +248,39 @@ class VGSPVTrainer(DPOTrainer):
             raise ValueError("Missing/invalid box data for spatial scaler.")
         return self.s_fallback_value, True
 
+    def _forward_preference_pair_logps_trl(
+        self, model, inputs: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_ids = inputs["input_ids"]
+        completion_mask = inputs["completion_mask"]
+        b2 = input_ids.size(0)
+        if b2 % 2 != 0:
+            raise ValueError(f"Expected even batch size for chosen+rejected stacking, got {b2}")
+        half = b2 // 2
+
+        kwargs = {k: v for k, v in inputs.items() if k not in _TRL_PREFERENCE_NON_MODEL_KEYS}
+        attn = kwargs.get("attention_mask")
+
+        seq_len = kwargs["input_ids"].shape[1]
+        _sync_seq_len_tensors_with_input_ids(kwargs, seq_len)
+
+        labels = input_ids.clone()
+        labels[completion_mask == 0] = -100
+        if attn is not None:
+            labels[attn == 0] = -100
+
+        outputs = model(**kwargs, use_cache=False)
+        logits = outputs.logits
+
+        lc, lr = logits[:half], logits[half:]
+        lbl_c, lbl_r = labels[:half], labels[half:]
+        return (
+            self._shifted_token_logps(lc, lbl_c),
+            lbl_c,
+            self._shifted_token_logps(lr, lbl_r),
+            lbl_r,
+        )
+
     def _forward_token_logps(self, model, inputs: dict[str, Any], prefix: str) -> tuple[torch.Tensor, torch.Tensor]:
         kwargs = self._extract_model_kwargs(inputs, prefix)
         labels = kwargs.get("labels", None)
@@ -245,17 +309,32 @@ class VGSPVTrainer(DPOTrainer):
             return chosen_policy_logp_total.new_zeros(chosen_policy_logp_total.shape), missing
         return torch.stack(vdpo), missing
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        concat_batch = "completion_mask" in inputs and "input_ids" in inputs
         try:
-            chosen_pol_logps, chosen_labels = self._forward_token_logps(model, inputs, "chosen")
-            rejected_pol_logps, rejected_labels = self._forward_token_logps(model, inputs, "rejected")
+            if concat_batch:
+                chosen_pol_logps, chosen_labels, rejected_pol_logps, rejected_labels = self._forward_preference_pair_logps_trl(
+                    model, inputs
+                )
+            else:
+                chosen_pol_logps, chosen_labels = self._forward_token_logps(model, inputs, "chosen")
+                rejected_pol_logps, rejected_labels = self._forward_token_logps(model, inputs, "rejected")
+        except KeyError:
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
         except Exception:
-            return super().compute_loss(model, inputs, return_outputs=return_outputs)
+            if concat_batch:
+                raise
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
 
         ref_model = self._get_ref_model(model)
-        with torch.no_grad():
-            chosen_ref_logps, _ = self._forward_token_logps(ref_model, inputs, "chosen")
-            rejected_ref_logps, _ = self._forward_token_logps(ref_model, inputs, "rejected")
+        # If we didn't pass a separate ref model, we must disable the LoRA adapter on the policy model
+        adapter_toggle = model.disable_adapter() if (self.ref_model is None and hasattr(model, "disable_adapter")) else contextlib.nullcontext()
+        with torch.no_grad(), adapter_toggle:
+            if concat_batch:
+                chosen_ref_logps, _, rejected_ref_logps, _ = self._forward_preference_pair_logps_trl(ref_model, inputs)
+            else:
+                chosen_ref_logps, _ = self._forward_token_logps(ref_model, inputs, "chosen")
+                rejected_ref_logps, _ = self._forward_token_logps(ref_model, inputs, "rejected")
 
         bs = chosen_labels.size(0)
         losses = []
@@ -308,7 +387,7 @@ class VGSPVTrainer(DPOTrainer):
                 fmt_losses.append(loss_fmt.detach())
 
         if not losses:
-            return super().compute_loss(model, inputs, return_outputs=return_outputs)
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
 
         base_loss = torch.stack(losses).mean()
         chosen_pol_total_t = torch.stack(chosen_pol_total) if chosen_pol_total else base_loss.new_zeros((bs,))
