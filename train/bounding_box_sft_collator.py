@@ -1,14 +1,14 @@
 """
 Batch multimodal conversations for bounding-box SFT: mask loss on user/prompt tokens only.
 
-Supports HF grounding rows and optional VG-SPV CSV rows (image + instruction + chosen trace).
+CSV-only (MM-SafetyBench / VG-SPV traces): image + instruction + chosen_reasoning_trace.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from train.bounding_box_sft_dataset import hf_row_to_bbox_sft_sample, vgspv_csv_row_to_bbox_sft_sample
+from train.bounding_box_sft_dataset import vgspv_csv_row_to_bbox_sft_sample
 
 
 def _split_user_assistant(messages: list[dict[str, Any]]) -> tuple[list[dict], list[dict]]:
@@ -21,16 +21,16 @@ class BoundingBoxSFTCollator:
     def __init__(
         self,
         processor: Any,
-        hf_dataset: Any,
         family: str,
+        csv_train_rows: list[dict[str, Any]],
         *,
-        csv_rows: list[dict[str, Any]] | None = None,
+        csv_eval_rows: list[dict[str, Any]] | None = None,
         vgspv_prompt_instruction: str = "",
     ):
         self.processor = processor
-        self.hf = hf_dataset
         self.family = family
-        self.csv_rows = csv_rows
+        self.csv_train_rows = csv_train_rows
+        self.csv_eval_rows = csv_eval_rows or []
         self.vgspv_prompt_instruction = vgspv_prompt_instruction
         tok = getattr(processor, "tokenizer", processor)
         tok.padding_side = "right"
@@ -41,17 +41,12 @@ class BoundingBoxSFTCollator:
         images: list[Any] = []
 
         for b in batch:
-            src = b.get("source", "hf")
+            pool = b.get("pool", "train")
             idx = int(b["idx"])
-            if src == "vgspv_csv":
-                if not self.csv_rows:
-                    raise ValueError("Collator received vgspv_csv batch but csv_rows is empty")
-                sample = vgspv_csv_row_to_bbox_sft_sample(
-                    self.csv_rows[idx],
-                    self.vgspv_prompt_instruction,
-                )
-            else:
-                sample = hf_row_to_bbox_sft_sample(self.hf[idx])
+            row_src = self.csv_eval_rows if pool == "eval" else self.csv_train_rows
+            if not row_src:
+                raise ValueError(f"Empty CSV rows for pool={pool!r}")
+            sample = vgspv_csv_row_to_bbox_sft_sample(row_src[idx], self.vgspv_prompt_instruction)
             messages = sample.messages
             user_only, full_msgs = _split_user_assistant(messages)
             text_prompt = self.processor.apply_chat_template(

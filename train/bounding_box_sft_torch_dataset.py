@@ -1,4 +1,4 @@
-"""Index wrapper for HF RefCOCO-style rows, optionally mixed with VG-SPV CSV rows (deterministic per index)."""
+"""Torch datasets for MM-SafetyBench / VG-SPV CSV-only bounding-box SFT."""
 
 from __future__ import annotations
 
@@ -7,38 +7,38 @@ from typing import Any
 import torch.utils.data
 
 
-class BoundingBoxSFTMixedIndexDataset(torch.utils.data.Dataset):
-    """
-    Each index maps to one training example over ``len(hf_dataset)`` steps per epoch.
+class BoundingBoxSFTCsvTrainDataset(torch.utils.data.Dataset):
+    """One index per training CSV row; collator loads ``vgspv_csv_row_to_bbox_sft_sample``."""
 
-    With probability ``mix_fraction`` (deterministic from ``index`` and ``seed``), the collator
-    loads a VG-SPV CSV row; otherwise the HF dataset row ``index % len(hf)``.
-    """
-
-    def __init__(
-        self,
-        hf_dataset: Any,
-        csv_rows: list[dict] | None = None,
-        *,
-        mix_fraction: float = 0.0,
-        seed: int = 42,
-    ):
-        self.hf = hf_dataset
-        self.csv_rows = csv_rows if csv_rows else None
-        self.mix_fraction = float(max(0.0, min(1.0, mix_fraction)))
-        self.seed = int(seed)
+    def __init__(self, csv_rows: list[dict[str, Any]]):
+        if not csv_rows:
+            raise ValueError("BoundingBoxSFTCsvTrainDataset requires non-empty csv_rows")
+        self._rows = csv_rows
 
     def __len__(self) -> int:
-        return len(self.hf)
+        return len(self._rows)
 
     def __getitem__(self, index: int) -> dict[str, int | str]:
-        if self.csv_rows and self.mix_fraction > 0.0:
-            u = ((index * 1103515245 + self.seed) & 0x7FFFFFFF) / float(0x7FFFFFFF)
-            if u < self.mix_fraction:
-                j = (index * 2654435761 + self.seed) % len(self.csv_rows)
-                return {"idx": int(j), "source": "vgspv_csv"}
-        return {"idx": int(index % len(self.hf)), "source": "hf"}
+        j = index % len(self._rows)
+        return {"idx": int(j), "source": "vgspv_csv", "pool": "train"}
 
 
-# Back-compat alias
-BoundingBoxSFTIndexDataset = BoundingBoxSFTMixedIndexDataset
+class BoundingBoxSFTCsvEvalDataset(torch.utils.data.Dataset):
+    """Validation indices: one per eval CSV row."""
+
+    def __init__(self, csv_eval_rows: list[dict[str, Any]]):
+        if not csv_eval_rows:
+            raise ValueError("BoundingBoxSFTCsvEvalDataset requires non-empty csv_eval_rows")
+        self._rows = csv_eval_rows
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, index: int) -> dict[str, int | str]:
+        return {"idx": int(index), "source": "vgspv_csv", "pool": "eval"}
+
+
+# Back-compat for imports expecting the old mixed/HF name
+BoundingBoxSFTMixedIndexDataset = BoundingBoxSFTCsvTrainDataset
+BoundingBoxSFTConcatEvalDataset = BoundingBoxSFTCsvEvalDataset
+BoundingBoxSFTIndexDataset = BoundingBoxSFTCsvTrainDataset

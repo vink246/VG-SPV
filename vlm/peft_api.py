@@ -7,6 +7,7 @@ from typing import Any
 import torch
 from peft import PeftModel
 
+from train.lora_factory import normalize_no_split_modules_for_accelerate
 from vlm.api import load_vlm, parse_dtype
 from vlm.schema import LoadedVLM
 
@@ -44,6 +45,7 @@ def load_vlm_with_optional_lora(
     )
     if not lora_adapter_path:
         return loaded
+    normalize_no_split_modules_for_accelerate(loaded.model)
     model = PeftModel.from_pretrained(
         loaded.model,
         lora_adapter_path,
