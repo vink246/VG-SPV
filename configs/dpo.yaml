@@ -7,6 +7,7 @@
 model_name: llava-hf/llava-v1.6-mistral-7b-hf
 data_path: null
 eval_data_path: null
+eval_steps: null
 output_dir: outputs/dpo
 prompt_instruction: null
 

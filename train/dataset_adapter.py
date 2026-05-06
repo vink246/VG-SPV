@@ -51,7 +51,8 @@ def csv_to_dpo_format(
         DPO_PERTURBED_IMAGE_COL: [],
     }
     for row in rows:
-        out[DPO_PROMPT_COL].append(prompt_instruction)
+        p = str(row.get("prompt", prompt_instruction) or prompt_instruction)
+        out[DPO_PROMPT_COL].append(p if "<|image|>" in p else f"<|image|>{p}")
         out[DPO_CHOSEN_COL].append(row[CHOSEN_REASONING_TRACE_COL])
         out[DPO_REJECTED_COL].append(row[REJECTED_REASONING_TRACE_COL])
         out[DPO_IMAGE_COL].append(row[IMAGE_COL])
