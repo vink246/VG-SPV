@@ -81,7 +81,8 @@ def draw_on_image(
     colors: list[str] | None = None,
 ) -> Image.Image:
     """Return a copy of ``image`` with rectangles and phrase labels for non-None boxes."""
-    colors = colors or ["#e63946", "#2a9d8f", "#e9c46a", "#264653", "#8338ec", "#fb5607"]
+    # Default to green outlines/labels unless custom colors are provided.
+    colors = colors or ["#22c55e"]
     im = image.copy().convert("RGB")
     draw = ImageDraw.Draw(im)
     w, h = im.size
