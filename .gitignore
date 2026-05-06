@@ -226,3 +226,12 @@ _batch_integration_artifacts/
 
 # tex files
 *.tex
+
+confirmed_asr.json
+ignored_prompts.json
+imgtest.jpg
+inference/*.png
+logs
+models/Llama*
+runs
+**/test.txt

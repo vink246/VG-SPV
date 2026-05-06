@@ -2,13 +2,13 @@
 #SBATCH --job-name=rej-traces
 #SBATCH --output=logs/rej-traces-%j.out
 #SBATCH --error=logs/rej-traces-%j.err
-#SBATCH --time=10:00:00
-#SBATCH --gres=gpu:h100
+#SBATCH --time=1:00:00
+# #SBATCH --gres=gpu:1
 #SBATCH -c 8
 #SBATCH --mem=32G
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=%u@gatech.edu
-
+#SBATCH -C'HX00|gpu-rtxpro-blackwell'
 
 set -euo pipefail
 

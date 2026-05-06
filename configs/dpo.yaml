@@ -45,3 +45,4 @@ lora_alpha: 128
 lora_dropout: 0.05
 lora_adapter_path: null
 merge_lora_adapter: false
+resume_from_checkpoint: null

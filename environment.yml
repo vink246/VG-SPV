@@ -12,14 +12,14 @@ dependencies:
   - packaging
   
   # PyTorch ecosystem (Compiled with CUDA 12.1)
-  - pytorch>=2.4.0
-  - torchvision
-  - torchaudio
-  - pytorch-cuda=12.1
+  - pytorch==2.6.0
+  - torchvision==0.21.0
+  - torchaudio==2.6.0
+  - pytorch-cuda=12.4
   
   # Pip dependencies for specific ML libraries
   - pip:
-      - transformers>=4.45.0
+      - transformers==5.4.0
       - huggingface_hub
       - accelerate
       - peft
@@ -29,6 +29,9 @@ dependencies:
       - qwen-vl-utils
       - gdown
       - openai>=1.40.0
+      - vllm
+      - bitsandbytes
+      - tensorboard
       # Install after env create with --no-build-isolation (see scripts/):
       # - scripts/install_grounding_dino.sh  (Grounding DINO)
       # - scripts/install_flash_attn.sh      (optional, flash-attn)

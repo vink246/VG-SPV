@@ -111,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     add("lora_dropout", float, "LoRA dropout")
     add("lora_adapter_path", str, "Optional bbox-SFT PEFT dir before DPO LoRA")
     add("merge_lora_adapter", _str2bool, "Merge bbox LoRA into dense weights before DPO LoRA")
+    add("resume_from_checkpoint", str, "Path to checkpoint folder to resume training entirely") # <--- ADD THIS
     p.add_argument(
         "--dump-default-config",
         action="store_true",
@@ -273,11 +274,12 @@ def main() -> None:
         strict_scaler_inputs=cfg.strict_scaler_inputs,
     )
     # Force a baseline evaluation before any weights are updated!
-    if eval_dataset is not None:
+    if eval_dataset is not None and not cfg.resume_from_checkpoint:
         print("=== Running Baseline Evaluation (Step 0) ===", flush=True)
-        trainer.evaluate()
+        baseline_metrics = trainer.evaluate()
+        print(f"Baseline Results: {baseline_metrics}", flush=True)
     print("=== Starting DPO Training ===", flush=True)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint if cfg.resume_from_checkpoint else None)
     trainer.save_model(cfg.output_dir)
 
 

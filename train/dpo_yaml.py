@@ -54,6 +54,7 @@ class DPOTrainConfig:
     lora_dropout: float = 0.05
     lora_adapter_path: str | None = None
     merge_lora_adapter: bool = False
+    resume_from_checkpoint: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DPOTrainConfig:

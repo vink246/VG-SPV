@@ -1,0 +1,10 @@
+datasets/
+
+*.out
+
+**/__pycache__/
+attention_mask_12(green)/
+evaluation/outputs*
+evaluation/*.zip
+logs
+run_guard_all.sh

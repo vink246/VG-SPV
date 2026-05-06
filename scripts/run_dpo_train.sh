@@ -2,7 +2,7 @@
 #SBATCH --job-name=vgspv-dpo
 #SBATCH --output=logs/vgspv-dpo-%j.out
 #SBATCH --error=logs/vgspv-dpo-%j.err
-#SBATCH --time=7:00:00
+#SBATCH --time=12:00:00
 #SBATCH --gres=gpu:h200
 #SBATCH -c 8
 #SBATCH --mem=48G
@@ -24,12 +24,15 @@ METHOD="method1"
 DPO_CONFIG=""
 
 MODEL_NAME="meta-llama/Llama-3.2-11B-Vision-Instruct"
-OUTPUT_DIR="outputs/dpo_llama32_11b_vgfdpo_method1"
+# MODEL_NAME="models/Llama-3.2-11B-SFT-Merged"
+OUTPUT_DIR="outputs/dpo_llama32_11b_vgfdpo_method1_cont"
 
 # Optional bbox-SFT PEFT dir loaded **before** DPO LoRA. Empty = DPO LoRA on base weights only.
 LORA_ADAPTER_PATH=""
 # Only if LORA_ADAPTER_PATH is set: use "--merge-lora-adapter true" to merge that adapter into dense weights first.
 MERGE_LORA_ADAPTER=""
+
+RESUME_CHECKPOINT=""
 
 PROMPT_INSTRUCTION=""
 
@@ -37,7 +40,7 @@ PROMPT_INSTRUCTION=""
 # 3. Hyperparameters (defaults aligned with configs/dpo.yaml; edit here)
 # ----------------------------------------------------------------------------
 
-NUM_TRAIN_EPOCHS=3
+NUM_TRAIN_EPOCHS=10
 # Per-device batch 4 is a reasonable default; increase if you have VRAM headroom.
 PER_DEVICE_TRAIN_BATCH_SIZE=4
 GRADIENT_ACCUMULATION_STEPS=16
@@ -114,6 +117,11 @@ if [[ -n "${PROMPT_INSTRUCTION}" ]]; then
   PROMPT_ARGS+=(--prompt-instruction "${PROMPT_INSTRUCTION}")
 fi
 
+RESUME_ARGS=()
+if [[ -n "${RESUME_CHECKPOINT}" ]]; then
+  RESUME_ARGS+=(--resume-from-checkpoint "${RESUME_CHECKPOINT}")
+fi
+
 echo
 echo "==== DPO train (train split + test eval each epoch; VG-fDPO; LoRA; V-DPO off) ===="
 
@@ -150,7 +158,8 @@ conda run -n vg-spv --no-capture-output python -u train/run_dpo.py \
     --lora-alpha                "${LORA_ALPHA}" \
     --lora-dropout              "${LORA_DROPOUT}" \
     "${LORA_PATH_ARGS[@]}" \
-    ${MERGE_LORA_ADAPTER}
+    ${MERGE_LORA_ADAPTER} \
+    "${RESUME_ARGS[@]}"
 
 echo
 echo "==== DONE ===="

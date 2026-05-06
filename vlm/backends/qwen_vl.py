@@ -3,7 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import AutoProcessor
+
+
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except ImportError:
+    print("transformers does not have Qwen3VLForConditionalGeneration. Please update transformers to the latest version.")
+    Qwen3VLForConditionalGeneration = None
 
 from vlm.schema import LoadedVLM
 
