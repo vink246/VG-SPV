@@ -221,8 +221,8 @@ outputs/*
 # Local artifacts from _integration_test_method1_single_batch.py
 _batch_integration_artifacts/
 
-# PDF files
-*.pdf
+# PDF files (repository root only; allow report/ and other subtrees)
+/*.pdf
 
 # tex files
 *.tex
@@ -235,3 +235,4 @@ logs
 models/Llama*
 runs
 **/test.txt
+report/
